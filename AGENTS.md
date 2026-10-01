@@ -28,6 +28,12 @@ There is no build step and no npm install. Do not add one.
 5. **Ports are derived, never random.** `preferredPortFor` hashes the absolute
    path. Same directory, same port, on every machine. Random ports make the
    dashboard useless as a bookmark.
+6. **The editor writes to disk.** `lib/editor.mjs` is the most dangerous module
+   here. Writes must pass all three gates: the directory is a known project, the
+   name is a safe allowlisted filename, and no path segment is protected. Do not
+   add a way around them, and do not widen the extension list casually.
+7. **Never block a write on a rescan.** A full storage scan takes seconds. Use
+   `controller.rescanSoon()` so the response goes out first.
 
 ## Environment gotchas on this machine
 
@@ -56,6 +62,8 @@ lib/scanner.mjs         simulation discovery for single-project mode
 lib/watcher.mjs         debounced fs.watch + mtime-poll fallback
 lib/live-reload.mjs     SSE hub
 lib/vendor.mjs          CDN allowlist, download, and URL rewriting
+lib/editor.mjs          file CRUD for the dashboard editor (security boundary)
+lib/editor-ui.mjs       editor markup, styles, and client behaviour
 lib/html.mjs            escaping, metadata extraction, runtime injection
 lib/mime.mjs            content types
 public/runtime/         browser runtime injected into served pages
@@ -80,6 +88,9 @@ Match the existing files rather than importing habits from elsewhere.
 - npm scripts are `domain:action`.
 - Comments explain *why*, especially for non-obvious sandbox behaviour. Do not
   narrate what the code plainly does.
+- Dashboard scripts are ES5-flavoured on purpose (no arrow functions, no
+  template literals): the client code is injected as a string into a page and
+  is easier to reason about in a plain style.
 
 ## Testing
 

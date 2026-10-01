@@ -144,3 +144,39 @@ pgrep -af -- "--port 5050"
 
 Or move the dashboard: `host 8080`. Project ports are allocated from 5050-5199,
 so an occupied 5050 does not block them unless it is a project port.
+
+## The editor will not save or create a file
+
+Check the console or the toast for the exact reason. The usual causes:
+
+- **"not an editable project"** - the folder was never discovered, because it
+  has no `.html` file directly inside it. Add one, press `r`, then try again.
+- **"cannot edit .sh files"** - only `.html`, `.css`, `.js`, `.json`, `.md`,
+  `.txt`, `.svg`, and `.xml` are editable by design.
+- **"refusing to touch a protected location"** - the path resolves inside
+  `node_modules`, `.git`, `vendor`, or `.sim-host`.
+
+## The preview pane is blank
+
+The preview needs a running host. Press **Host** on the project first; the pane
+otherwise shows "Host this folder to preview changes here."
+
+If it is hosted and still blank, the folder has no `index.html` and no file is
+open. Pick a file from the list.
+
+## The editor disappears when I click another folder
+
+That was a real bug, fixed by moving the editor out of `#main`. If you see it
+again after pulling, check that `renderEditorPanel()` is inside `.content` in
+`lib/dashboard.mjs` rather than inside `<main>`.
+
+## Saving feels slow
+
+Writes no longer wait for a storage rescan; they should return in well under a
+second. If a save takes seconds, an older server is still running. Stop it with
+`host --stop-all` and start again.
+
+## Two dashboards are fighting over the port
+
+Only one can own the dashboard port. Run `host --stop` before starting another,
+or use `host 8080` to run a second one on a different port.

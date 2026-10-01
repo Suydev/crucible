@@ -21,6 +21,8 @@ was there before, and hoping the CDN still resolves. This removes all three:
 - **Deps that just work.** A page that loads three.js from unpkg gets it
   downloaded once into a local cache and rewritten to a local path. Afterwards
   it works offline, and the exact version stays pinned.
+- **Built-in editor.** Create, edit, rename, and delete files without leaving
+  the dashboard, with a split preview against the live server.
 
 ## Install
 
@@ -69,6 +71,29 @@ select a folder to see its HTML files, then press **Host**.
 
 Live hosts show a green label and their port in the tree, so you can see what is
 already up before starting something else.
+
+## Editor
+
+Select a project and the editor appears: a file list on the left, a live
+preview on the right when you host it.
+
+| Action | How |
+| --- | --- |
+| New file | **New**, or press `n` with a project selected |
+| Choose a template | Canvas 2D, Three.js, or Empty |
+| Save | **Save**, or `Ctrl+S` / `Cmd+S` |
+| Split view | **Split**, or `Alt+S` in the editor |
+| Rename / Delete | Buttons in the editor toolbar |
+
+Editing an existing HTML file works too - pick it from the list. Tab inserts
+two spaces instead of moving focus, and the buffer autosaves about a second
+after you stop typing.
+
+Preview shows the real hosted simulation, so what you see is what a visitor
+gets. Host the folder first; the preview picks up the port automatically.
+
+Files are saved to disk exactly as written - the dashboard editor is a thin
+front end over the filesystem, not a virtual layer.
 
 ## Ports
 

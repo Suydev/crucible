@@ -137,6 +137,44 @@ disk are never written.
 A cold request for a vendor path also fetches on demand, so a page that hardcodes
 a local vendor path works even if the rewrite never ran.
 
+## The editor
+
+The dashboard can create, read, write, rename, and delete files. That makes
+`lib/editor.mjs` the most security-sensitive module in the repo.
+
+Three independent gates must all pass before a byte reaches disk:
+
+1. **Known project.** `assertKnownProject` checks the target directory is one
+   the scanner discovered as a project. An arbitrary path - `/etc`, a home
+   directory config - is rejected with 403 regardless of its filename.
+2. **Valid name.** The filename must be a single segment with an allowlisted
+   extension (`.html`, `.css`, `.js`, `.json`, `.md`, `.txt`, `.svg`, `.xml`).
+   Separators, `..`, dotfiles, and null bytes are rejected.
+3. **Safe segment.** No path segment may be dot-prefixed or one of
+   `node_modules`, `.git`, `vendor`, `.sim-host`, `dist`, `build`, and friends.
+
+Writes are atomic (temp file plus rename) and capped at 2 MB, so a crash cannot
+leave a truncated simulation.
+
+### Why writes do not wait for a rescan
+
+A full storage scan takes seconds on a home directory. Awaiting it inside the
+save handler turned a 10 ms write into a 7 s request, and the browser showed
+the editor hanging. Writes now respond immediately and call
+`controller.rescanSoon()`, which debounces a background scan and broadcasts the
+result over SSE. The sidebar still updates; the editor does not wait for it.
+
+### Why the editor lives outside `#main`
+
+`renderMain()` replaces `#main`'s `innerHTML` on every state change. If the
+editor were inside it, each re-render would destroy the open file, the caret
+position, and any unsaved buffer. It is mounted as a sibling inside the
+scrollable `.content` column and only toggled with the `hidden` attribute.
+
+`sync()` deliberately does not clear an open file just because the project list
+does not contain it. A rescan triggered by our own create can arrive with a
+stale snapshot, and trusting it discarded the file that had just been opened.
+
 ## Security boundaries
 
 - **Path traversal.** Every request path is resolved and checked with
@@ -144,6 +182,14 @@ a local vendor path works even if the rewrite never ran.
 - **CDN allowlist.** Only listed hosts may be fetched. This prevents the server
   being used as a proxy for arbitrary addresses.
 - **Asset names.** Runtime asset requests must match `^[\w.-]+$`.
-- **Body size.** JSON request bodies are capped at 64 kB.
+- **Body size.** JSON request bodies are capped at 4 MB, and file content at 2 MB.
+- **Editor scope.** Writes are limited to known projects and safe filenames.
 - **Scan bounds.** The workspace walk is limited by depth, directory count, file
   count, and HTML file size, so a pathological tree cannot hang the dashboard.
+
+### Binding
+
+The dashboard binds to `127.0.0.1` only. It serves arbitrary files from your
+home directory and can write to project folders, so it must not be exposed on a
+network interface. If you need remote access, tunnel it deliberately rather
+than changing `--host` to `0.0.0.0`.

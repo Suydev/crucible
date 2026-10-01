@@ -51,6 +51,15 @@ import {
   preferredPortFor,
 } from './lib/ports.mjs';
 import { defaultRoots, scanWorkspace } from './lib/workspace.mjs';
+import {
+  EditorError,
+  deleteFile,
+  listEditable,
+  readFile,
+  renameFile,
+  templateFor,
+  writeFile,
+} from './lib/editor.mjs';
 
 const SELF = fileURLToPath(import.meta.url);
 
@@ -141,6 +150,22 @@ export class HostController {
     this.tree = buildTree(this.projects, { roots: this.roots });
     this.bus.broadcast('instances', { changed: true });
     return this.projects;
+  }
+
+  /**
+   * Schedules a rescan without waiting for it. A full scan of a home directory
+   * takes seconds; making a file write block on that turned a 10 ms save into a
+   * 7 s wait. The scan still runs so the sidebar picks the new file up, but the
+   * response goes out first and repeated edits coalesce into one scan.
+   */
+  rescanSoon(delayMs = 50) {
+    if (this.rescanTimer) return this.rescanTimer;
+    this.rescanTimer = setTimeout(() => {
+      this.rescanTimer = null;
+      this.rescan().catch(() => {});
+    }, delayMs);
+    this.rescanTimer.unref?.();
+    return this.rescanTimer;
   }
 
   /** Live instances keyed by directory, with an aliveness flag. */
@@ -519,6 +544,12 @@ export function createServer(config) {
           return;
         }
 
+        // ---- editor
+        if (action.startsWith('file/')) {
+          await handleFileApi(action.slice('file/'.length), req, res, log, controller);
+          return;
+        }
+
         sendJson(res, 404, { error: 'unknown action' });
         log(404);
         return;
@@ -659,20 +690,114 @@ export function createServer(config) {
 }
 
 /** Reads and parses a JSON request body, bounded to avoid abuse. */
-async function readBody(req, limit = 64 * 1024) {
+async function readBody(req, limit = 4 * 1024 * 1024) {
   const chunks = [];
   let size = 0;
   for await (const chunk of req) {
     size += chunk.length;
-    if (size > limit) throw new Error('request body too large');
+    if (size > limit) throw new EditorError('request body too large', 413);
     chunks.push(chunk);
   }
   if (!chunks.length) return {};
   try {
     return JSON.parse(Buffer.concat(chunks).toString('utf8'));
   } catch {
-    throw new Error('invalid JSON body');
+    throw new EditorError('invalid JSON body', 400);
   }
+}
+
+/**
+ * Editor API. Writes are the dangerous operation here, so the target directory
+ * must be a directory this dashboard actually discovered as a project - not
+ * merely a path that resolves to something. That prevents the editor from being
+ * pointed at an arbitrary directory such as /etc or a home directory config.
+ */
+async function handleFileApi(action, req, res, log, controller) {
+  const status = (code) => log(code);
+
+  try {
+    if (action === 'list' && req.method === 'GET') {
+      const dir = new URL(req.url, 'http://x').searchParams.get('dir') ?? '';
+      assertKnownProject(controller, dir);
+      const files = await listEditable(dir);
+      status(200);
+      sendJson(res, 200, { dir, files });
+      return;
+    }
+
+    if (action === 'read' && req.method === 'GET') {
+      const params = new URL(req.url, 'http://x').searchParams;
+      const dir = params.get('dir') ?? '';
+      assertKnownProject(controller, dir);
+      const file = await readFile(dir, params.get('name') ?? '');
+      status(200);
+      sendJson(res, 200, file);
+      return;
+    }
+
+    if (action === 'save' && req.method === 'POST') {
+      const body = await readBody(req);
+      assertKnownProject(controller, body.dir);
+      const result = await writeFile(body.dir, body.name, body.content);
+      status(200);
+      sendJson(res, 200, result);
+      controller.rescanSoon();
+      return;
+    }
+
+    if (action === 'create' && req.method === 'POST') {
+      const body = await readBody(req);
+      assertKnownProject(controller, body.dir);
+      const content = body.content ?? templateFor(body.template ?? 'html');
+      const result = await writeFile(body.dir, body.name, content);
+      status(200);
+      sendJson(res, 200, result);
+      controller.rescanSoon();
+      return;
+    }
+
+    if (action === 'delete' && req.method === 'POST') {
+      const body = await readBody(req);
+      assertKnownProject(controller, body.dir);
+      const result = await deleteFile(body.dir, body.name);
+      status(200);
+      sendJson(res, 200, result);
+      controller.rescanSoon();
+      return;
+    }
+
+    if (action === 'rename' && req.method === 'POST') {
+      const body = await readBody(req);
+      assertKnownProject(controller, body.dir);
+      const result = await renameFile(body.dir, body.from, body.to);
+      status(200);
+      sendJson(res, 200, result);
+      controller.rescanSoon();
+      return;
+    }
+
+    sendJson(res, 404, { error: `unknown file action: ${action}` });
+    status(404);
+  } catch (error) {
+    const code = error instanceof EditorError ? error.status : 500;
+    if (code >= 500) err(`editor ${action}: ${error.message}`);
+    sendJson(res, code, { error: error.message });
+    status(code);
+  }
+}
+
+/**
+ * Rejects any directory the dashboard did not discover as a project. The
+ * editor can therefore only touch folders that already contain HTML, which is
+ * exactly the set a user would expect to edit here.
+ */
+function assertKnownProject(controller, dir) {
+  const abs = path.resolve(String(dir ?? ''));
+  const known = controller.projects.some((p) => p.dir === abs);
+  if (!known) {
+    throw new EditorError(`not an editable project: ${abs}`, 403);
+  }
+  return abs;
 }
 
 async function vendorAllFor(urls, contextPath) {

@@ -106,6 +106,32 @@ simHost.reload();                        // reload programmatically
 simHost.onBeforeReload(() => saveState()); // run before an automatic reload
 ```
 
+## Editor shortcuts
+
+| Key | Action |
+| --- | --- |
+| `n` | New file (when a project is selected) |
+| `Ctrl+S` / `Cmd+S` | Save the open file |
+| `Alt+S` | Toggle split editor and preview |
+| `Tab` | Insert two spaces |
+| `r` | Rescan storage |
+
+## Editor file rules
+
+The editor can only touch these extensions:
+
+```
+.html .htm .css .js .mjs .json .md .txt .svg .xml
+```
+
+It refuses dotfiles, anything with a path separator, and anything inside
+`node_modules`, `.git`, `vendor`, `.sim-host`, `dist`, or `build`. Files are
+capped at 2 MB. The target folder must be one the dashboard discovered as a
+project, so pointing the editor at an arbitrary directory returns 403.
+
+To edit something outside that set - a shell script, a Python file - use your
+normal editor. The dashboard editor is for the HTML/JS simulations it serves.
+
 ## Browser behaviour
 
 | Key | Action |
