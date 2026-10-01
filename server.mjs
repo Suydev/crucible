@@ -38,19 +38,17 @@ import { LiveReloadHub, SSE_PATH } from './lib/live-reload.mjs';
 import {
   VENDOR_PREFIX,
   rewriteCdnUrls,
-  vendorPathFor,
   vendorOne,
   findCdnUrls,
   isVendorable,
 } from './lib/vendor.mjs';
 import {
-  DEFAULT_PORT,
   InstanceRegistry,
   allocatePort,
   isPortFree,
   preferredPortFor,
 } from './lib/ports.mjs';
-import { defaultRoots, scanWorkspace } from './lib/workspace.mjs';
+import { scanWorkspace } from './lib/workspace.mjs';
 import {
   EditorError,
   deleteFile,
@@ -110,13 +108,74 @@ function sendJson(res, status, data) {
   sendText(res, status, JSON.stringify(data), 'application/json; charset=utf-8');
 }
 
+/**
+ * Streams a file to the response.
+ *
+ * Every stream needs an error listener. Without one, any read failure after
+ * the stat succeeds - EIO, the file being unlinked mid-stream, a directory
+ * (EISDIR), or the editor's atomic rename swapping the inode underneath us -
+ * emits an unhandled 'error' event and takes the whole process down. A single
+ * request should never be able to kill the server.
+ */
+function sendFileStream(req, res, absPath, stat) {
+  if (!stat.isFile()) {
+    sendText(res, 404, 'Not found');
+    return;
+  }
+
+  const stream = createReadStream(absPath);
+  let failed = false;
+
+  const onError = (err) => {
+    failed = true;
+    if (!res.headersSent) {
+      sendText(res, 404, `Not found: ${err.code ?? err.message}`);
+    } else {
+      // Headers already promised a body we cannot deliver. Destroying the
+      // response is the only way to avoid a truncated transfer hanging the
+      // client until it times out.
+      res.destroy(err);
+    }
+  };
+
+  stream.on('error', onError);
+  res.on('error', () => stream.destroy());
+
+  if (res.headersSent) {
+    stream.pipe(res);
+    return;
+  }
+
+  res.writeHead(200, {
+    'Content-Type': contentTypeFor(absPath),
+    'Content-Length': stat.size,
+    'Cache-Control': isReloadSensitive(absPath) ? 'no-store' : 'no-cache',
+  });
+  stream.pipe(res);
+  if (!failed) stream.on('end', () => { /* nothing to do; pipe ends the response */ });
+}
+
 /** Accepts an absolute dir or a path relative to any configured root. */
+/**
+ * Resolves a caller-supplied directory and requires it to sit inside one of
+ * the configured storage roots.
+ *
+ * The previous containment check was isInside('/', abs), which is true for
+ * EVERY absolute path on the machine - path.relative('/', '/etc') is 'etc'.
+ * That let the host API be pointed at any directory on the box, including /etc.
+ * Checking against the configured roots, and requiring an exact project match
+ * in HostController, closes that off.
+ */
 function resolveDir(candidate, roots) {
   if (typeof candidate !== 'string' || !candidate.trim()) return null;
+
   const abs = path.isAbsolute(candidate)
     ? path.resolve(candidate)
     : path.resolve(roots[0] ?? ROOT, candidate);
-  return isInside('/', abs) ? abs : null;
+
+  // Allow the root itself and anything beneath one of the configured roots.
+  const within = roots.some((root) => abs === path.resolve(root) || isInside(root, abs));
+  return within ? abs : null;
 }
 
 // ---------------------------------------------------------------- controller
@@ -204,9 +263,23 @@ export class HostController {
   }
 
   /** Starts a child host for a directory, unless one is already running. */
+  /**
+   * True when this directory was discovered as a hostable project.
+   * Host and stop both require it: without this check any directory on the
+   * machine could be served, because resolveDir only constrains the path to a
+   * configured root, and a root may legitimately contain unrelated folders.
+   */
+  isKnownProject(dir) {
+    const abs = path.resolve(String(dir ?? ''));
+    return this.projects.some((p) => p.dir === abs);
+  }
+
   async hostDir(dir, { preferredPort = null } = {}) {
     const abs = resolveDir(dir, this.roots);
     if (!abs) throw new Error('invalid directory');
+    if (!this.isKnownProject(abs)) {
+      throw new Error(`not a hostable project: ${abs}`);
+    }
 
     let stat;
     try {
@@ -235,12 +308,31 @@ export class HostController {
       '--single',
       '--root', abs,
       '--port', String(port),
+      // Children inherit the parent's verbosity. Without this they defaulted to
+      // logging every request, and a synchronous console.log to a file-backed fd
+      // made each response cost ~19ms instead of ~3.7ms - a measured 5x.
+      ...(this.config.quiet ? ['--quiet'] : []),
       ...(this.config.noReload ? ['--no-reload'] : []),
     ], {
       detached: true,
-      stdio: ['ignore', log.fd, log.fd],
+      // Pipes rather than the raw fd: Node makes fd-backed stdio synchronous
+      // and pipe stdio async, so the log content survives without the per-write
+      // stall. The streams are drained into the same file.
+      stdio: ['ignore', 'pipe', 'pipe'],
       env: { ...process.env, SIM_HOST_CHILD: '1' },
     });
+
+    // Drain the child's output into its log file. Streamed writes keep this
+    // off the request path; a failing log must never take the host down.
+    const appendToLog = (stream) => {
+      if (!stream) return;
+      stream.on('data', (chunk) => {
+        fs.appendFile(logPath, chunk).catch(() => {});
+      });
+      stream.on('error', () => {});
+    };
+    appendToLog(child.stdout);
+    appendToLog(child.stderr);
 
     child.unref();
     await log.close().catch(() => {});
@@ -272,6 +364,14 @@ export class HostController {
 
     const record = this.registry.get(abs);
     const child = this.children.get(abs);
+
+    // Nothing of ours owns this directory. Returning early avoids waiting on a
+    // port we never started and, more importantly, avoids signalling a pid
+    // that a stale registry entry may have left pointing at a recycled process.
+    if (!record && !child) {
+      return { dir: abs, stopped: false, signalled: false };
+    }
+
     const pid = child?.pid ?? record?.pid ?? null;
 
     let signalled = false;
@@ -284,14 +384,20 @@ export class HostController {
       }
     }
 
-    const deadline = Date.now() + 2500;
-    while (Date.now() < deadline) {
-      if (!(await isPortFree(record?.port ?? 0, this.config.host))) break;
-      await new Promise((r) => setTimeout(r, 120));
-    }
+    if (record?.port) {
+      const deadline = Date.now() + 2500;
+      while (Date.now() < deadline) {
+        if (await isPortFree(record.port, this.config.host)) break;
+        await new Promise((r) => setTimeout(r, 120));
+      }
 
-    if (record && !(await isPortFree(record.port, this.config.host))) {
-      try { process.kill(pid, 'SIGKILL'); } catch { /* already gone */ }
+      // Escalate only when we still hold a live registry record for this
+      // directory, so we can never SIGKILL an unrelated process.
+      if (!(await isPortFree(record.port, this.config.host))) {
+        if (await this.registry.isAlive(record)) {
+          try { process.kill(pid, 'SIGKILL'); } catch { /* already gone */ }
+        }
+      }
     }
 
     this.children.delete(abs);
@@ -356,25 +462,29 @@ export function createStaticHandler({ root, liveReload, vendorRoot, onVendor }) 
     sendText(res, 200, html, 'text/html; charset=utf-8');
   }
 
-  async function serveFile(res, absPath) {
-    const headers = {
-      'Content-Type': contentTypeFor(absPath),
-      'Cache-Control': isReloadSensitive(absPath) ? 'no-store' : 'no-cache',
-    };
+  async function serveFile(req, res, absPath) {
+    let stat;
     try {
-      const stat = await fs.stat(absPath);
-      res.writeHead(200, { ...headers, 'Content-Length': stat.size });
-      createReadStream(absPath).pipe(res);
+      stat = await fs.stat(absPath);
     } catch {
       sendText(res, 404, 'Not found');
+      return;
     }
+    sendFileStream(req, res, absPath, stat);
   }
 
   const handler = async (req, res) => {
     const urlPath = safeDecode(req.url ?? '/') ?? '/';
 
     if (urlPath === SSE_PATH) {
-      hub?.attach(req, res, urlPath);
+      if (hub) {
+        hub.attach(req, res, urlPath);
+      } else {
+        // With live reload disabled there is no stream to attach. Returning
+        // without responding left the browser waiting on a socket that would
+        // never produce headers, so the request hung until it timed out.
+        sendText(res, 503, 'live reload is disabled');
+      }
       return;
     }
 
@@ -394,7 +504,7 @@ export function createStaticHandler({ root, liveReload, vendorRoot, onVendor }) 
         if (isVendorable(remote)) {
           try {
             await vendorOne(remote, vendorRoot);
-            await serveFile(res, abs);
+            await serveFile(req, res, abs);
             return;
           } catch (error) {
             sendText(res, 502, `vendor fetch failed: ${error.message}`);
@@ -404,18 +514,26 @@ export function createStaticHandler({ root, liveReload, vendorRoot, onVendor }) 
         sendText(res, 404, 'Not vendored');
         return;
       }
-      await serveFile(res, abs);
+      await serveFile(req, res, abs);
       return;
     }
 
-    // Runtime assets
+    // Runtime assets.
+    // The name pattern alone is not enough: it accepts "..", which resolves to
+    // a directory and made createReadStream emit EISDIR, killing the process.
     if (urlPath.startsWith('/__simhost/')) {
       const name = urlPath.slice('/__simhost/'.length);
-      if (!/^[\w.-]+$/.test(name)) {
+      if (!/^[\w.-]+$/.test(name) || name === '.' || name === '..') {
         sendText(res, 400, 'Bad asset name');
         return;
       }
-      await serveFile(res, path.join(ROOT, 'public', 'runtime', name));
+      const runtimeDir = path.join(ROOT, 'public', 'runtime');
+      const abs = path.resolve(runtimeDir, name);
+      if (abs !== runtimeDir && !isInside(runtimeDir, abs)) {
+        sendText(res, 403, 'Forbidden');
+        return;
+      }
+      await serveFile(req, res, abs);
       return;
     }
 
@@ -466,7 +584,7 @@ export function createStaticHandler({ root, liveReload, vendorRoot, onVendor }) 
       return;
     }
 
-    await serveFile(res, abs);
+    await serveFile(req, res, abs);
   };
 
   handler.hub = hub;
@@ -523,7 +641,17 @@ export function createServer(config) {
 
         if (action === 'host' && req.method === 'POST') {
           const body = await readBody(req);
-          const result = await controller.hostDir(body.dir, { preferredPort: body.port ?? null });
+          let result;
+          try {
+            result = await controller.hostDir(body.dir, { preferredPort: body.port ?? null });
+          } catch (err) {
+            // A rejected directory is a client error, not a server fault.
+            // Reporting 500 made a rejected request look like a crash.
+            const code = /not a hostable project/.test(err.message) ? 403 : 400;
+            sendJson(res, code, { error: err.message });
+            log(code);
+            return;
+          }
           sendJson(res, 200, {
             ok: true,
             dir: result.dir,
@@ -539,7 +667,14 @@ export function createServer(config) {
 
         if (action === 'stop' && req.method === 'POST') {
           const body = await readBody(req);
-          sendJson(res, 200, await controller.stopDir(body.dir));
+          try {
+            sendJson(res, 200, await controller.stopDir(body.dir));
+          } catch (err) {
+            const code = /invalid directory/.test(err.message) ? 400 : 500;
+            sendJson(res, code, { error: err.message });
+            log(code);
+            return;
+          }
           log(200);
           return;
         }
@@ -612,20 +747,26 @@ export function createServer(config) {
       // ---- runtime assets at top level
       if (urlPath.startsWith('/__simhost/')) {
         const name = urlPath.slice('/__simhost/'.length);
-        if (!/^[\w.-]+$/.test(name)) {
+        if (!/^[\w.-]+$/.test(name) || name === '.' || name === '..') {
           sendText(res, 400, 'Bad asset name');
           log(400);
           return;
         }
+        const runtimeDir = path.join(ROOT, 'public', 'runtime');
+        const abs = path.resolve(runtimeDir, name);
+        if (abs !== runtimeDir && !isInside(runtimeDir, abs)) {
+          sendText(res, 403, 'Forbidden');
+          log(403);
+          return;
+        }
         try {
-          const abs = path.join(ROOT, 'public', 'runtime', name);
           const stat = await fs.stat(abs);
-          res.writeHead(200, {
-            'Content-Type': contentTypeFor(abs),
-            'Content-Length': stat.size,
-            'Cache-Control': 'no-store',
-          });
-          createReadStream(abs).pipe(res);
+          if (!stat.isFile()) {
+            sendText(res, 404, 'Not found');
+            log(404);
+            return;
+          }
+          sendFileStream(req, res, abs, stat);
           log(200);
         } catch {
           sendText(res, 404, 'Not found');
@@ -669,10 +810,27 @@ export function createServer(config) {
         });
       },
     });
+    // Routes a change to the cheapest thing that makes the browser correct.
+    // CSS gets an in-place stylesheet swap so animations and accumulated state
+    // survive; everything else needs a real reload.
+    const toUrlPath = (absFile) => `/${path.relative(config.root, absFile).split(path.sep).join('/')}`;
+
     server.watchDir = () => startWatching([config.root], {
       onChange: ({ added, removed, modified }) => {
         const files = [...added, ...removed, ...modified];
-        staticHandler.hub?.reloadAll(files.length ? path.basename(files[0]) : 'change');
+        if (!files.length) return;
+
+        const hub = staticHandler.hub;
+        if (!hub) return;
+
+        // The first stylesheet is the common case; if several changed, fall
+        // back to a reload rather than swapping only one of them.
+        if (files.length === 1 && /\.css$/i.test(files[0])) {
+          hub.broadcast('css', { href: toUrlPath(files[0]) });
+          return;
+        }
+
+        hub.reloadAll(files.length === 1 ? path.basename(files[0]) : `${files.length} files`);
       },
       onError: () => {},
       verbose: config.verbose,

@@ -52,12 +52,25 @@ Then `hash -r` if the shell had already resolved the name.
 | `host 8080` | ...on another port |
 | `host --roots ~/projects,~/work` | Scan specific storage roots |
 | `host --list` | Print discovered projects and their ports, then exit |
+| `host --set-roots a,b` | Remember which directories to scan |
+| `host --show-settings` | Show the saved configuration |
+| `npm run ports` | Show every project with its port and whether it is free |
 | `host ~/some/dir` | Serve one directory directly on its own derived port |
 | `host --status` | Show the dashboard and every hosted project |
 | `host --stop` | Stop the dashboard |
 | `host --stop-all` | Stop the dashboard and all hosted projects |
 | `hs` | Restart the dashboard |
 | `ha` | Stop everything |
+
+## Settings
+
+Roots and port are remembered in `~/.sim-host/config.json`, so the dashboard
+shows the same projects every session and ports stay bookmarkable.
+
+```bash
+host --set-roots ~/projects,~/work
+host --show-settings
+```
 
 ## Dashboard
 
@@ -120,12 +133,30 @@ That serves the directory directly, with live reload, and prints the URL.
 
 Every served HTML document gets a small runtime injected in memory:
 
-- **SSE reload.** Save a file, the browser reloads. Works for HTML, CSS, and JS
-  in the served directory.
+- **SSE reload.** Save a file, the browser reloads. HTML, CSS, and JS in the
+  served directory all trigger it.
+- **CSS swaps in place.** Editing a stylesheet does *not* navigate. The stylesheet
+  is hot-swapped so animations, timers, and accumulated state all survive -
+  reload only when the change actually needs it.
+- **State survives reloads.** `simHost.state` is persisted across reloads, along
+  with scroll position and form values, so a one-line edit does not cost you the
+  camera position you had tuned to reproduce a bug.
+- **On-screen errors.** An uncaught exception or rejected promise appears in a
+  dismissible card on the page itself. You do not need DevTools open to see that
+  your physics loop is throwing.
 - **HUD.** Bottom-right pill showing connection state and open tab count.
 - **Shortcuts.** `r` reloads, `i` returns to the index.
-- **API.** `window.simHost.reload()`, `window.simHost.toast('message')`,
-  `window.simHost.status('running')` for use inside a simulation.
+
+API for use inside a simulation:
+
+```js
+simHost.reload();                  // reload programmatically
+simHost.toast('saved');            // transient message
+simHost.status('running');         // text in the HUD pill
+simHost.state.camera = { x: 3 };   // preserved across reloads
+simHost.warn('watch out');         // non-fatal overlay message
+simHost.errorCount                 // how many errors this session
+```
 
 Files on disk are never modified. Injection happens per request.
 
@@ -169,7 +200,10 @@ Node 20 or newer. That is the entire dependency list.
 ## Tests
 
 ```bash
-npm test
+npm test        # 119 tests, no network required
+npm run lint    # project rules: syntax, scripts exist, no deps, strict mode
+npm run ports   # port map for every discovered project
 ```
 
-47 tests, no network required.
+The suite includes real HTTP requests against a live server. Unit tests alone
+missed a bug where every static asset returned HTTP 500 after a refactor.

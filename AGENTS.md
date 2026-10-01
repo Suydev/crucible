@@ -34,6 +34,12 @@ There is no build step and no npm install. Do not add one.
    add a way around them, and do not widen the extension list casually.
 7. **Never block a write on a rescan.** A full storage scan takes seconds. Use
    `controller.rescanSoon()` so the response goes out first.
+8. **Every stream needs an error listener.** An unhandled `'error'` on a
+   `createReadStream` kills the process. Use `sendFileStream`, which handles it.
+9. **Never mutate a served file on disk.** Injection and CDN rewriting happen in
+   memory per request, so a simulation stays a plain HTML file usable without
+   this server. (Restates rule 2 because it is the easiest thing to break while
+   adding a feature.)
 
 ## Environment gotchas on this machine
 
@@ -64,12 +70,16 @@ lib/live-reload.mjs     SSE hub
 lib/vendor.mjs          CDN allowlist, download, and URL rewriting
 lib/editor.mjs          file CRUD for the dashboard editor (security boundary)
 lib/editor-ui.mjs       editor markup, styles, and client behaviour
+lib/settings.mjs        persisted roots/port in ~/.sim-host/config.json
 lib/html.mjs            escaping, metadata extraction, runtime injection
 lib/mime.mjs            content types
 public/runtime/         browser runtime injected into served pages
 scripts/host.sh         the permanent `host` command
 scripts/kill-port.mjs   port probing and process termination
-test/                   node:test suites
+scripts/run-background.mjs  true detach for long-lived processes
+scripts/check-project.mjs    project lint (no ESLint here)
+scripts/list-ports.mjs       port map for every project
+test/                   node:test suites, including real HTTP checks
 ```
 
 ## Conventions
@@ -101,6 +111,19 @@ npm test        # node --test test/*.test.mjs
 Tests must not require a network connection and must not depend on which ports
 happen to be occupied. `test/ports.test.mjs` shows how to test port conflicts
 without assuming a clean machine.
+
+Two traps that have already bitten this suite:
+
+- `fetch()` normalises `/..` out of a URL before sending it, so a traversal test
+  written with `fetch` passes without ever reaching the handler. Use a raw socket
+  when the un-normalised bytes are the thing under test.
+- A test cannot assert "the process exits", because the test runner keeps the
+  event loop alive itself. Assert on the specific resource instead, via
+  `process.getActiveResourcesInfo()`.
+
+When a refactor changes a function signature used by the request path, add a
+real HTTP test. `test/serve.test.mjs` exists because a signature change once
+made every static asset return HTTP 500 while all 100+ unit tests passed.
 
 ## Verifying changes
 

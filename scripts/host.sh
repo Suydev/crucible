@@ -18,9 +18,12 @@
 
 set -euo pipefail
 
-DEFAULT_PORT="${SIM_HOST_PORT:-5050}"
-PORT="$DEFAULT_PORT"
-ROOTS="${SIM_HOST_ROOTS:-$HOME}"
+# Settings live in ~/.sim-host/config.json so the same tree is scanned every
+# session. A dashboard started with ad-hoc --roots used to show a different set
+# of projects each time, which undermined the deterministic ports.
+DEFAULT_PORT="${SIM_HOST_PORT:-}"
+PORT=""
+ROOTS="${SIM_HOST_ROOTS:-}"
 ACTION="dashboard"
 TARGET_DIR=""
 BACKGROUND=1
@@ -57,6 +60,10 @@ Single project:
   host <dir>           Serve one directory directly on its own derived port
   host <dir> 8080      ...on a specific port
 
+Settings (remembered in ~/.sim-host/config.json):
+  host --set-roots <a,b>   Persist which directories to scan
+  host --show-settings     Show the saved configuration
+
 Management:
   host --list          List discovered projects with their ports
   host --status        Show what is running
@@ -79,6 +86,8 @@ while [ $# -gt 0 ]; do
     --status)         ACTION="status"; shift ;;
     --list)           ACTION="list"; shift ;;
     --roots)          ROOTS="${2:?--roots needs a value}"; shift 2 ;;
+    --set-roots)      ACTION="set-roots"; ROOTS="${2:?--set-roots needs a value}"; shift 2 ;;
+    --show-settings)  ACTION="show-settings"; shift ;;
     -f|--foreground)  BACKGROUND=0; shift ;;
     -q|--quiet)       QUIET=1; shift ;;
     -p|--port)        PORT="${2:?--port needs a value}"; shift 2 ;;
@@ -99,18 +108,43 @@ done
 
 # ---------------------------------------------------------------- locate
 
+# Resolve the repo before anything else needs SIM_DIR.
+if [ -z "${SIM_HOST_DIR:-}" ]; then
+  for candidate in "$HOME/sim-host" "$PWD" "$HOME/.local/share/sim-host"; do
+    if [ -f "$candidate/server.mjs" ]; then SIM_HOST_DIR="$candidate"; break; fi
+  done
+fi
 SIM_DIR="${SIM_HOST_DIR:-$HOME/sim-host}"
 SERVER="$SIM_DIR/server.mjs"
 KILL_PORT="$SIM_DIR/scripts/kill-port.mjs"
 
-if [ ! -f "$SERVER" ]; then
-  for candidate in "$PWD/server.mjs" "$HOME/.local/share/sim-host/server.mjs"; do
-    [ -f "$candidate" ] && { SERVER="$candidate"; SIM_DIR="$(dirname "$candidate")"; break; }
-  done
-fi
-
 [ -f "$SERVER" ] || die "cannot locate server.mjs (set SIM_HOST_DIR or run from the repo)" 1
 [ -f "$KILL_PORT" ] || KILL_PORT=""
+
+# ---------------------------------------------------------------- settings
+
+read_setting() {
+  SIM_HOST_LIB="$SIM_DIR/lib" node -e '
+    const [key] = process.argv.slice(1);
+    import(process.env.SIM_HOST_LIB + "/settings.mjs")
+      .then(async (m) => {
+        const s = await m.readSettings();
+        const v = s[key];
+        if (Array.isArray(v)) process.stdout.write(v.join(","));
+        else if (v != null) process.stdout.write(String(v));
+      })
+      .catch(() => {});
+  ' "$1" 2>/dev/null
+}
+
+if [ -z "$ROOTS" ]; then
+  ROOTS="$(read_setting roots)"
+  [ -n "$ROOTS" ] || ROOTS="$HOME"
+fi
+if [ -z "$PORT" ]; then
+  PORT="$(read_setting port)"
+  [ -n "$PORT" ] || PORT="5050"
+fi
 
 # ---------------------------------------------------------------- helpers
 
@@ -161,7 +195,36 @@ open_url() {
 
 # ---------------------------------------------------------------- actions
 
+save_settings() {
+  SIM_HOST_LIB="$SIM_DIR/lib" node -e '
+    import(process.env.SIM_HOST_LIB + "/settings.mjs").then(async (m) => {
+      const [roots, port] = process.argv.slice(1);
+      await m.writeSettings({
+        roots: roots ? roots.split(",").map((s) => s.trim()).filter(Boolean) : undefined,
+        port: port ? Number(port) : undefined,
+      });
+    }).catch((e) => { console.error(e.message); process.exit(1); });
+  ' "${1:-}" "${2:-}"
+}
+
 case "$ACTION" in
+  set-roots)
+    if [ -z "$ROOTS" ]; then
+      die "--set-roots needs a value, for example: host --set-roots ~/projects,~/work" 2
+    fi
+    save_settings "$ROOTS" "$PORT"
+    ok "saved roots to ~/.sim-host/config.json"
+    info "${ROOTS}"
+    exit 0
+    ;;
+
+  show-settings)
+    printf '%s
+' "$HOME/.sim-host/config.json"
+    [ -f "$HOME/.sim-host/config.json" ] && cat "$HOME/.sim-host/config.json" || echo "(none yet)"
+    exit 0
+    ;;
+
   list)
     exec node "$SERVER" --roots "$ROOTS" --list
     ;;
