@@ -1,0 +1,6 @@
+{
+  "title": "Bouncing Particles",
+  "description": "Elastic collisions with wall reflection. Drag to spawn particles, click to reset.",
+  "tags": ["physics", "canvas", "interactive"],
+  "order": 1
+}

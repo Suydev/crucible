@@ -1,0 +1,20 @@
+/* runtime.css
+   Injected into every served simulation. Intentionally near-empty: it only
+   supplies the small shared surface the dev runtime needs, so simulations keep
+   full control of their own layout and styling. */
+
+:root {
+  color-scheme: dark;
+}
+
+[data-sim-host-focus] {
+  outline: 2px solid #4fc3f7;
+  outline-offset: 3px;
+}
+
+/* While a reload is in flight, freeze pointer input so a stray click cannot
+   land on a half-swapped document. */
+body[data-sim-host-reloading] {
+  cursor: progress;
+  pointer-events: none;
+}

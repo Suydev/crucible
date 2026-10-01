@@ -1,0 +1,146 @@
+# Troubleshooting
+
+## `host --stop` says the port is still in use
+
+The server only terminates processes whose command line looks like a sim-host
+server. It will not kill an unrelated service that grabbed the port, because
+doing so could take down something you care about.
+
+Find out who owns it:
+
+```bash
+pgrep -af -- "--port 5050"
+```
+
+If it is a stale sim-host that escaped the registry, kill it by pid. If it is
+something else, either stop that service or start sim-host on a different port
+with `host 8080`.
+
+## A project shows a port but nothing loads
+
+Check the child process is alive:
+
+```bash
+host --status
+curl -s localhost:5050/__simhost/api/state | head -c 2000
+```
+
+Each instance carries an `alive` flag. If it is `false`, the registry has a
+stale entry; press **Rescan** in the dashboard or run `host --stop-all` and
+start again.
+
+If it is alive but the page 404s, the folder has no `index.html`. The child
+server falls back to a directory listing, so `/` should show links. If it 404s
+anyway, you are probably on the dashboard port rather than the project port.
+
+## Live reload does not fire
+
+In order of likelihood:
+
+1. **You are editing a file outside the served root.** Children watch only their
+   own directory. Serving `~/project` does not watch `~/project/vendor/lib`.
+2. **The project was started before the file existed.** In dashboard mode, press
+   **Rescan** or press `r`.
+3. **The editor writes atomically** via rename. The mtime poll covers this, but
+   only within one second. Wait a beat and reload manually with `r`.
+4. **A caching proxy.** Served documents use `no-store`; a corporate proxy can
+   override that.
+
+Verify the stream is alive: the HUD pill should be green. If it is red, the SSE
+connection dropped and the runtime is retrying with backoff.
+
+## A page loads but its CDN library is missing
+
+Check whether the URL was rewritten:
+
+```bash
+curl -s localhost:PORT/the-page.html | grep -oE '<script[^>]*src="[^"]*"'
+```
+
+Rewritten paths begin `/__simhost/vendor/`. If the original `https://` URL is
+still there, the host was not on the allowlist - see the list in
+[CONFIGURATION.md](CONFIGURATION.md).
+
+Then check the cache:
+
+```bash
+ls -R vendor | head -30
+cat vendor/manifest.json
+```
+
+A `502 vendor fetch failed` response means the download was attempted and failed,
+usually a network problem or a version that no longer exists. Pin an existing
+version and reload.
+
+## Two folders show the same port
+
+They should not: ports are derived from absolute paths. If it happens, the two
+paths hash into a collision within the 150-port range, and the second folder was
+allocated the next free port instead. The dashboard marks this with "port N
+taken". Force a specific port with `host <dir> <port>`.
+
+## The dashboard finds nothing
+
+```bash
+host --list
+```
+
+If that is empty, the roots do not contain your files. The default root is your
+home directory; pass others explicitly:
+
+```bash
+host --roots ~/projects,~/Documents
+```
+
+Remember a folder only counts if it *directly* contains an `.html` file. A
+folder holding only subfolders is a container, not a project.
+
+## The scan is slow
+
+A home directory with many large trees will take a few seconds on first scan.
+Narrow it:
+
+```bash
+host --roots ~/projects
+```
+
+Hard skips (never descended into) include `node_modules`, `.git`, `dist`,
+`build`, `target`, `.next`, `.nuxt`, and all dot-directories.
+
+## Port probing fails in this sandbox
+
+This machine has no `ss` and no `netstat`, and `/proc/net/tcp` is not readable,
+so socket-to-pid mapping is impossible. `scripts/kill-port.mjs` therefore uses a
+real TCP connect attempt to answer "is it free?" and `pgrep -f` to answer "who
+owns it?". If you write new tooling here, do not reach for `ss` - it is absent.
+See [AGENTS.md](../AGENTS.md).
+
+## A port is stuck but nothing is listening
+
+An orphaned child can hold a port briefly while shutting down. Check:
+
+```bash
+pgrep -af "server.mjs"
+```
+
+`host --stop-all` signals every registered child and waits up to 2.5 seconds
+before escalating to SIGKILL.
+
+## Changing the served file does nothing
+
+Files on disk are never written, by design. Injection happens per request in
+memory. If you were expecting the dev runtime to be added to your file, it is
+not - check that the page is being served through a host rather than opened as
+`file://`.
+
+Opening the HTML directly from disk bypasses the server entirely: no live
+reload, no vendoring, no runtime. Always go through the hosted URL.
+
+## Port 5050 is taken by something else
+
+```bash
+pgrep -af -- "--port 5050"
+```
+
+Or move the dashboard: `host 8080`. Project ports are allocated from 5050-5199,
+so an occupied 5050 does not block them unless it is a project port.

@@ -1,0 +1,31 @@
+{
+  "name": "sim-host",
+  "version": "1.0.0",
+  "description": "Zero-dependency local host for HTML/JS simulations with live reload and an auto-generated index.",
+  "private": true,
+  "type": "module",
+  "main": "server.mjs",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "scripts": {
+    "start": "node server.mjs",
+    "dev": "node --watch server.mjs",
+    "dev:verbose": "node server.mjs --verbose",
+    "host:list": "node server.mjs --list",
+    "host:stop": "node scripts/stop-host.mjs",
+    "host:restart": "node scripts/restart-host.mjs",
+    "host:status": "node scripts/host-status.mjs",
+    "capture": "node scripts/capture-screenshot.mjs",
+    "lint:headers": "node scripts/check-script-headers.mjs",
+    "test": "node --test test/*.test.mjs"
+  },
+  "keywords": [
+    "simulation",
+    "canvas",
+    "live-reload",
+    "static-server",
+    "zero-dependency"
+  ],
+  "license": "MIT"
+}

@@ -1,0 +1,14 @@
+# Runtime state
+.sim-host/
+
+# Vendored CDN dependencies, fetched on demand and pinned in vendor/manifest.json
+vendor/
+
+# Logs
+*.log
+
+# Editor / OS noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
