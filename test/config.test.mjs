@@ -47,11 +47,12 @@ test('default port is 5050', () => {
 });
 
 test('vendor cache is shared, not per served directory', () => {
-  const config = loadConfig(['--single', '--root', '/tmp/whatever'], {});
-  assert.ok(
-    config.vendorPath.includes('sim-host') || config.vendorPath.includes('.sim-host'),
-    `vendor cache should live in the sim-host repo, got ${config.vendorPath}`,
-  );
+  // Two different served folders must resolve to the same cache, otherwise a
+  // library like three.js is downloaded once per project.
+  const a = loadConfig(['--single', '--root', '/tmp/one'], {});
+  const b = loadConfig(['--single', '--root', '/tmp/two'], {});
+  assert.equal(a.vendorPath, b.vendorPath, 'cache must not depend on the served directory');
+  assert.ok(!a.vendorPath.startsWith('/tmp/'), 'cache must not live under the served dir');
 });
 
 test('registry path is inside the sim-host repo', () => {

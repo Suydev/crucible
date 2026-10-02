@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # host.sh
-# Permanent shell entrypoint for sim-host.
+# Permanent shell entrypoint for crucible.
 #
 # Starts the control dashboard in the background, or manages individual hosts
 # through its API. Safe to re-run: starting twice restarts rather than stacking
@@ -18,7 +18,7 @@
 
 set -euo pipefail
 
-# Settings live in ~/.sim-host/config.json so the same tree is scanned every
+# Settings live in ~/.crucible/config.json so the same tree is scanned every
 # session. A dashboard started with ad-hoc --roots used to show a different set
 # of projects each time, which undermined the deterministic ports.
 DEFAULT_PORT="${SIM_HOST_PORT:-}"
@@ -60,7 +60,7 @@ Single project:
   host <dir>           Serve one directory directly on its own derived port
   host <dir> 8080      ...on a specific port
 
-Settings (remembered in ~/.sim-host/config.json):
+Settings (remembered in ~/.crucible/config.json):
   host --set-roots <a,b>   Persist which directories to scan
   host --show-settings     Show the saved configuration
 
@@ -110,11 +110,11 @@ done
 
 # Resolve the repo before anything else needs SIM_DIR.
 if [ -z "${SIM_HOST_DIR:-}" ]; then
-  for candidate in "$HOME/sim-host" "$PWD" "$HOME/.local/share/sim-host"; do
+  for candidate in "$HOME/crucible" "$PWD" "$HOME/.local/share/crucible"; do
     if [ -f "$candidate/server.mjs" ]; then SIM_HOST_DIR="$candidate"; break; fi
   done
 fi
-SIM_DIR="${SIM_HOST_DIR:-$HOME/sim-host}"
+SIM_DIR="${SIM_HOST_DIR:-$HOME/crucible}"
 SERVER="$SIM_DIR/server.mjs"
 KILL_PORT="$SIM_DIR/scripts/kill-port.mjs"
 
@@ -213,15 +213,15 @@ case "$ACTION" in
       die "--set-roots needs a value, for example: host --set-roots ~/projects,~/work" 2
     fi
     save_settings "$ROOTS" "$PORT"
-    ok "saved roots to ~/.sim-host/config.json"
+    ok "saved roots to ~/.crucible/config.json"
     info "${ROOTS}"
     exit 0
     ;;
 
   show-settings)
     printf '%s
-' "$HOME/.sim-host/config.json"
-    [ -f "$HOME/.sim-host/config.json" ] && cat "$HOME/.sim-host/config.json" || echo "(none yet)"
+' "$HOME/.crucible/config.json"
+    [ -f "$HOME/.crucible/config.json" ] && cat "$HOME/.crucible/config.json" || echo "(none yet)"
     exit 0
     ;;
 
@@ -289,7 +289,7 @@ if port_in_use "$PORT"; then
 fi
 
 if [ "$BACKGROUND" -eq 1 ]; then
-  LOG="/tmp/sim-host-${PORT}.log"
+  LOG="/tmp/crucible-${PORT}.log"
   # run-background.mjs performs a true detach (new session, stdio to the log,
   # unref'd handle) so this shell does not block on the child's pipes.
   node "$SIM_DIR/scripts/run-background.mjs" "$LOG" \
@@ -302,7 +302,7 @@ if [ "$BACKGROUND" -eq 1 ]; then
   fi
 
   URL="http://localhost:${PORT}/"
-  ok "sim-host dashboard running"
+  ok "crucible dashboard running"
   info "url      ${CYAN}${URL}${RESET}"
   info "roots    ${ROOTS}"
   info "log      ${DIM}${LOG}${RESET}"

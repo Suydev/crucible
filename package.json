@@ -1,7 +1,7 @@
 {
-  "name": "sim-host",
+  "name": "crucible",
   "version": "1.0.0",
-  "description": "Zero-dependency local host for HTML/JS simulations with live reload and an auto-generated index.",
+  "description": "Local host and control dashboard for HTML/JS simulations. Zero dependencies.",
   "private": true,
   "type": "module",
   "main": "server.mjs",
@@ -24,7 +24,18 @@
     "canvas",
     "live-reload",
     "static-server",
-    "zero-dependency"
+    "dashboard",
+    "dev-server",
+    "zero-dependency",
+    "local-first"
   ],
-  "license": "MIT"
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Suydev/crucible"
+  },
+  "bugs": {
+    "url": "https://github.com/Suydev/crucible/issues"
+  },
+  "homepage": "https://github.com/Suydev/crucible#readme"
 }

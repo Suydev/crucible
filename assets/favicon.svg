@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="32" height="32" role="img" aria-label="Crucible">
+  <title>Crucible</title>
+  <!-- Favicon variant: heavier strokes and no secondary detail, so the shape
+       survives being scaled to 16px in a browser tab. -->
+  <defs>
+    <linearGradient id="f-melt" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#7fcdf5"/>
+      <stop offset="100%" stop-color="#4557c8"/>
+    </linearGradient>
+    <linearGradient id="f-lip" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#c2ccdb"/>
+      <stop offset="50%" stop-color="#ffffff"/>
+      <stop offset="100%" stop-color="#9aa6ba"/>
+    </linearGradient>
+    <clipPath id="f-clip">
+      <path d="M31 28 H97 L86 84 C82 102 73 110 64 110 C55 110 46 102 42 84 Z"/>
+    </clipPath>
+  </defs>
+  <path d="M31 28 H97 L86 84 C82 102 73 110 64 110 C55 110 46 102 42 84 Z" fill="#1b202a"/>
+  <g clip-path="url(#f-clip)">
+    <path d="M26 48 Q49 38 64 48 T102 48 V122 H26 Z" fill="url(#f-melt)"/>
+  </g>
+  <path d="M31 28 H97 L86 84 C82 102 73 110 64 110 C55 110 46 102 42 84 Z"
+        fill="none" stroke="#7c8698" stroke-width="5" stroke-linejoin="round"/>
+  <circle cx="64" cy="46" r="8.5" fill="#fbbf24"/>
+  <rect x="26" y="20" width="76" height="13" rx="6.5" fill="url(#f-lip)"/>
+</svg>

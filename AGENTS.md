@@ -70,7 +70,7 @@ lib/live-reload.mjs     SSE hub
 lib/vendor.mjs          CDN allowlist, download, and URL rewriting
 lib/editor.mjs          file CRUD for the dashboard editor (security boundary)
 lib/editor-ui.mjs       editor markup, styles, and client behaviour
-lib/settings.mjs        persisted roots/port in ~/.sim-host/config.json
+lib/settings.mjs        persisted roots/port in ~/.crucible/config.json
 lib/html.mjs            escaping, metadata extraction, runtime injection
 lib/mime.mjs            content types
 public/runtime/         browser runtime injected into served pages

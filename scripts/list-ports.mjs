@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // list-ports.mjs
-// Prints every directory sim-host would host, with the port it will get and
+// Prints every directory crucible would host, with the port it will get and
 // whether that port is currently taken.
 //
 // Usage: node scripts/list-ports.mjs [--all]

@@ -55,7 +55,7 @@ export async function readCmdline(pid) {
 }
 
 /**
- * Finds pids that look like a sim-host server bound to `port`.
+ * Finds pids that look like a crucible server bound to `port`.
  *
  * Matching is deliberately narrow. We only kill processes whose command line
  * looks like our own server, so a stray `node something.js --port 5050` or an

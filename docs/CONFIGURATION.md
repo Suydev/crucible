@@ -74,7 +74,7 @@ host --roots ~/projects,~/work
 
 ## Vendor cache
 
-Lives in the sim-host repo (`vendor/`) and is shared by all hosted projects, so
+Lives in the crucible repo (`vendor/`) and is shared by all hosted projects, so
 a library is stored once rather than once per folder.
 
 ```bash
@@ -125,7 +125,7 @@ The editor can only touch these extensions:
 ```
 
 It refuses dotfiles, anything with a path separator, and anything inside
-`node_modules`, `.git`, `vendor`, `.sim-host`, `dist`, or `build`. Files are
+`node_modules`, `.git`, `vendor`, `.crucible`, `dist`, or `build`. Files are
 capped at 2 MB. The target folder must be one the dashboard discovered as a
 project, so pointing the editor at an arbitrary directory returns 403.
 
@@ -147,9 +147,9 @@ number of open tabs when more than one.
 
 ## Logs
 
-Background hosts write to `/tmp/sim-host-<port>.log`, and `host --single` uses
-`/tmp/sim-host-<dirname>.log`.
+Background hosts write to `/tmp/crucible-<port>.log`, and `host --single` uses
+`/tmp/crucible-<dirname>.log`.
 
 ```bash
-tail -f /tmp/sim-host-5050.log
+tail -f /tmp/crucible-5050.log
 ```

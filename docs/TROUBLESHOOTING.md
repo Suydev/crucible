@@ -2,7 +2,7 @@
 
 ## `host --stop` says the port is still in use
 
-The server only terminates processes whose command line looks like a sim-host
+The server only terminates processes whose command line looks like a crucible
 server. It will not kill an unrelated service that grabbed the port, because
 doing so could take down something you care about.
 
@@ -12,8 +12,8 @@ Find out who owns it:
 pgrep -af -- "--port 5050"
 ```
 
-If it is a stale sim-host that escaped the registry, kill it by pid. If it is
-something else, either stop that service or start sim-host on a different port
+If it is a stale crucible that escaped the registry, kill it by pid. If it is
+something else, either stop that service or start crucible on a different port
 with `host 8080`.
 
 ## A project shows a port but nothing loads
@@ -154,7 +154,7 @@ Check the console or the toast for the exact reason. The usual causes:
 - **"cannot edit .sh files"** - only `.html`, `.css`, `.js`, `.json`, `.md`,
   `.txt`, `.svg`, and `.xml` are editable by design.
 - **"refusing to touch a protected location"** - the path resolves inside
-  `node_modules`, `.git`, `vendor`, or `.sim-host`.
+  `node_modules`, `.git`, `vendor`, or `.crucible`.
 
 ## The preview pane is blank
 

@@ -27,7 +27,7 @@ else
   CYAN=""; GREEN=""; DIM=""; RESET=""
 fi
 
-LOG="/tmp/sim-host-$(basename "$DIR").log"
+LOG="/tmp/crucible-$(basename "$DIR").log"
 node "$ROOT/scripts/run-background.mjs" "$LOG" \
   node "$SERVER" --single --root "$DIR" --port "$PORT" >/dev/null
 

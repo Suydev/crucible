@@ -1,0 +1,52 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 520 128" width="520" height="128" role="img" aria-label="Crucible">
+  <title>Crucible</title>
+  <defs>
+    <linearGradient id="cr-melt" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#8ed4f7"/>
+      <stop offset="50%" stop-color="#4fc3f7"/>
+      <stop offset="100%" stop-color="#4557c8"/>
+    </linearGradient>
+    <linearGradient id="cr-lip" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#b9c4d4"/>
+      <stop offset="45%" stop-color="#ffffff"/>
+      <stop offset="100%" stop-color="#9aa6ba"/>
+    </linearGradient>
+    <linearGradient id="cr-body" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#2a313d"/>
+      <stop offset="100%" stop-color="#171c25"/>
+    </linearGradient>
+    <radialGradient id="cr-orb" cx="46%" cy="38%" r="62%">
+      <stop offset="0%" stop-color="#fff3cf"/>
+      <stop offset="50%" stop-color="#fbbf24"/>
+      <stop offset="100%" stop-color="#e8890c"/>
+    </radialGradient>
+    <clipPath id="cr-clip">
+      <path d="M31 28 H97 L86 84 C82 102 73 110 64 110 C55 110 46 102 42 84 Z"/>
+    </clipPath>
+  </defs>
+
+  <!-- mark -->
+  <g transform="translate(0,0)">
+    <path d="M31 28 H97 L86 84 C82 102 73 110 64 110 C55 110 46 102 42 84 Z" fill="url(#cr-body)"/>
+    <g clip-path="url(#cr-clip)">
+      <path d="M28 47 Q49 38 64 47 T100 47 V120 H28 Z" fill="url(#cr-melt)"/>
+      <path d="M28 47 Q49 38 64 47 T100 47" fill="none" stroke="#e8f7ff" stroke-width="2.6" stroke-linecap="round" opacity=".9"/>
+      <path d="M32 62 Q50 54 68 62 T96 62" fill="none" stroke="#ffffff" stroke-width="1.6" opacity=".16"/>
+    </g>
+    <path d="M31 28 H97 L86 84 C82 102 73 110 64 110 C55 110 46 102 42 84 Z" fill="none" stroke="#69748a" stroke-width="2" stroke-linejoin="round"/>
+    <circle cx="64" cy="45" r="6.5" fill="url(#cr-orb)"/>
+    <rect x="26" y="22" width="76" height="11" rx="5.5" fill="url(#cr-lip)"/>
+  </g>
+
+  <!-- wordmark. Rendered with a system stack; the shipped PNG is baked so the
+       README never depends on font availability. -->
+  <text x="156" y="86"
+        font-family="Liberation Sans, Helvetica Neue, Helvetica, Arial, sans-serif"
+        font-size="52" font-weight="700" letter-spacing="-1.2"
+        fill="#e9edf5">crucible</text>
+
+  <text x="160" y="108"
+        font-family="Liberation Sans, Helvetica Neue, Helvetica, Arial, sans-serif"
+        font-size="15.5" font-weight="400" letter-spacing="1.6"
+        fill="#6f7889">LOCAL SIMULATION HOST</text>
+</svg>

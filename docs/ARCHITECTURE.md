@@ -26,7 +26,7 @@ process rather than as a route inside the dashboard. The consequences:
   looking at that project.
 - Stopping a project is just signalling one pid.
 
-The dashboard tracks pids in `.sim-host/instances.json`, so it survives a
+The dashboard tracks pids in `.crucible/instances.json`, so it survives a
 restart and can prune entries whose process died.
 
 ## Request flow
@@ -113,12 +113,12 @@ reliability. Events are debounced 120ms so a multi-file save fires once.
 `injectRuntime` adds three things to any served document:
 
 ```html
-<link rel="stylesheet" href="/__simhost/runtime.css" data-sim-host-runtime>
-<script data-sim-host-runtime>window.__SIM_HOST__ = {...};</script>
-<script type="module" src="/__simhost/runtime.js" data-sim-host-runtime></script>
+<link rel="stylesheet" href="/__simhost/runtime.css" data-crucible-runtime>
+<script data-crucible-runtime>window.__SIM_HOST__ = {...};</script>
+<script type="module" src="/__simhost/runtime.js" data-crucible-runtime></script>
 ```
 
-It is idempotent, guarded by the `data-sim-host-runtime` marker, because
+It is idempotent, guarded by the `data-crucible-runtime` marker, because
 documents are re-processed on every request and a naive implementation would
 stack duplicate tags on each load.
 
@@ -151,7 +151,7 @@ Three independent gates must all pass before a byte reaches disk:
    extension (`.html`, `.css`, `.js`, `.json`, `.md`, `.txt`, `.svg`, `.xml`).
    Separators, `..`, dotfiles, and null bytes are rejected.
 3. **Safe segment.** No path segment may be dot-prefixed or one of
-   `node_modules`, `.git`, `vendor`, `.sim-host`, `dist`, `build`, and friends.
+   `node_modules`, `.git`, `vendor`, `.crucible`, `dist`, `build`, and friends.
 
 Writes are atomic (temp file plus rename) and capped at 2 MB, so a crash cannot
 leave a truncated simulation.
