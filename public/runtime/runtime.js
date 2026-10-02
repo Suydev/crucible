@@ -21,6 +21,8 @@ function ensureStyles() {
   style.textContent = `
     #${HUD_ID} {
       position: fixed; bottom: 10px; right: 10px; z-index: 2147483647;
+      /* Clear the home indicator on notched phones. */
+      bottom: calc(10px + env(safe-area-inset-bottom, 0px));
       display: flex; align-items: center; gap: 8px;
       padding: 6px 10px; border-radius: 999px;
       background: rgba(18,20,26,.88); color: #cfd4e0;
@@ -31,6 +33,11 @@ function ensureStyles() {
       user-select: none; opacity: .5; transition: opacity .2s ease;
     }
     #${HUD_ID}:hover { opacity: 1; }
+    /* Touch devices have no hover, so the pill stayed half-transparent and,
+       being fixed, sat on top of the code editor swallowing taps. */
+    @media (hover: none) and (pointer: coarse) {
+      #${HUD_ID} { display: none; }
+    }
     #${HUD_ID} .dot { width: 8px; height: 8px; border-radius: 50%; background: #f0a03c; flex: none; }
     #${HUD_ID}.live .dot { background: #4ade80; }
     #${HUD_ID}.down .dot { background: #f87171; }
@@ -39,6 +46,7 @@ function ensureStyles() {
     #${TOAST_ID} {
       position: fixed; top: 14px; left: 50%; transform: translateX(-50%) translateY(-16px);
       z-index: 2147483647; padding: 8px 16px; border-radius: 999px;
+      max-width: calc(100vw - 24px);
       background: rgba(18,20,26,.94); color: #e6e9ef;
       border: 1px solid rgba(255,255,255,.14); font: 13px/1 ui-sans-serif, system-ui, sans-serif;
       box-shadow: 0 6px 20px rgba(0,0,0,.4);

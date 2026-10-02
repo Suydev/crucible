@@ -28,7 +28,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawn } from 'node:child_process';
 
-import { loadConfig, USAGE, ROOT } from './lib/config.mjs';
+import { loadConfig, ConfigError, USAGE, ROOT } from './lib/config.mjs';
 import { contentTypeFor, isReloadSensitive } from './lib/mime.mjs';
 import { escapeHtml, injectRuntime } from './lib/html.mjs';
 import { scanSimulations } from './lib/scanner.mjs';
@@ -38,6 +38,7 @@ import { LiveReloadHub, SSE_PATH } from './lib/live-reload.mjs';
 import {
   VENDOR_PREFIX,
   rewriteCdnUrls,
+  vendorPathFor,
   vendorOne,
   findCdnUrls,
   isVendorable,
@@ -52,6 +53,7 @@ import {
 } from './lib/ports.mjs';
 import { scanWorkspace } from './lib/workspace.mjs';
 import { guardApiRequest } from './lib/http-guard.mjs';
+import { buildImportMap, injectImportMap } from './lib/import-map.mjs';
 import {
   EditorError,
   deleteFile,
@@ -191,6 +193,8 @@ export class HostController {
     this.registry = new InstanceRegistry(config.registryPath, { host: config.host });
     /** @type {Map<string, import('node:child_process').ChildProcess>} */
     this.children = new Map();
+    /** Per-directory promise chain serialising host/stop. */
+    this.locks = new Map();
     this.projects = [];
     this.tree = { name: 'storage', type: 'dir', path: '/', children: [] };
     this.bus = new LiveReloadHub();
@@ -291,12 +295,41 @@ export class HostController {
     return this.projects.some((p) => p.dir === abs);
   }
 
-  async hostDir(dir, { preferredPort = null } = {}) {
-    const abs = resolveDir(dir, this.roots);
-    if (!abs) throw new Error('invalid directory');
-    if (!this.isKnownProject(abs)) {
-      throw new Error(`not a hostable project: ${abs}`);
+  /**
+   * Serialises host and stop per directory.
+   *
+   * Without this, concurrent requests for the same folder all passed the
+   * "is it already running" check before any of them spawned, so N calls
+   * produced N children but one registry entry - and the entry recorded a pid
+   * that had already exited, leaving a live server permanently unreachable by
+   * `host --stop`.
+   */
+  async #serialise(key, fn) {
+    const previous = this.locks.get(key) ?? Promise.resolve();
+    const next = previous.then(fn, fn);
+    // Keep the chain alive regardless of outcome.
+    this.locks.set(key, next.catch(() => {}));
+    try {
+      return await next;
+    } finally {
+      if (this.locks.get(key) === next.catch(() => {})) this.locks.delete(key);
     }
+  }
+
+  hostDir(dir, { preferredPort = null } = {}) {
+    const abs = path.resolve(String(dir ?? ''));
+    return this.#serialise(`host:${abs}`, () => this.#hostDir(abs, preferredPort));
+  }
+
+  stopDir(dir) {
+    const abs = path.resolve(String(dir ?? ''));
+    return this.#serialise(`host:${abs}`, () => this.#stopDir(abs));
+  }
+
+  async #hostDir(abs, preferredPort) {
+    // Both gates: inside a configured root, and a known project.
+    if (!resolveDir(abs, this.roots)) throw new Error('invalid directory');
+    if (!this.isKnownProject(abs)) throw new Error(`not a hostable project: ${abs}`);
 
     let stat;
     try {
@@ -354,6 +387,27 @@ export class HostController {
     child.unref();
     await log.close().catch(() => {});
 
+    // Wait for the port to actually accept before recording anything. The port
+    // can be taken between allocatePort and spawn, in which case the child dies
+    // immediately; registering it anyway left a stale pid in instances.json that
+    // `host --stop` could never resolve, and the API reported success.
+    const deadline = Date.now() + 6000;
+    let cameUp = false;
+    while (Date.now() < deadline) {
+      if (!(await isPortFree(port, this.config.host))) { cameUp = true; break; }
+      if (child.exitCode !== null || child.signalCode) break;
+      await new Promise((r) => setTimeout(r, 120));
+    }
+
+    if (!cameUp) {
+      try { process.kill(child.pid, 'SIGTERM'); } catch { /* already gone */ }
+      const where = logPath;
+      throw new Error(
+        `could not start a host on port ${port} (see ${where}). `
+        + `The port may have been taken, or the directory may be unreadable.`,
+      );
+    }
+
     const record = await this.registry.register(abs, {
       port,
       pid: child.pid,
@@ -362,22 +416,13 @@ export class HostController {
     });
 
     this.children.set(abs, child);
-
-    // Wait for the port to accept so the dashboard never shows a dead host.
-    const deadline = Date.now() + 6000;
-    while (Date.now() < deadline) {
-      if (!(await isPortFree(port, this.config.host))) break;
-      await new Promise((r) => setTimeout(r, 120));
-    }
-
     this.bus.broadcast('instances', { dir: abs });
     return { ...record, derived, drifted };
   }
 
   /** Stops a hosted directory, preferring a graceful SIGTERM then SIGKILL. */
-  async stopDir(dir) {
-    const abs = resolveDir(dir, this.roots);
-    if (!abs) throw new Error('invalid directory');
+  async #stopDir(abs) {
+    if (!resolveDir(abs, this.roots)) throw new Error('invalid directory');
 
     const record = this.registry.get(abs);
     const child = this.children.get(abs);
@@ -462,8 +507,32 @@ export function createStaticHandler({ root, liveReload, vendorRoot, onVendor }) 
     const found = findCdnUrls(raw);
     let working = raw;
     if (found.length && vendorRoot) {
-      await onVendor?.(found, htmlPath);
-      working = rewriteCdnUrls(working).html;
+      const results = (await onVendor?.(found, htmlPath)) ?? [];
+      // A download that failed must not be rewritten to a local path: the
+      // document would load with 200 while every sub-request 404s, and the
+      // failure only showed up as a console error.
+      const failed = results.filter((r) => r?.status === 'error');
+      for (const bad of failed) {
+        warn(`vendor failed: ${bad.url} - ${bad.error}`);
+      }
+      const okUrls = new Set(results.filter((r) => r?.status !== 'error').map((r) => r?.url));
+      const stillRemote = found.filter((u) => !okUrls.has(u));
+      if (stillRemote.length) {
+        warn(`${stillRemote.length} dependency/dependencies unavailable; left as remote URLs`);
+      }
+
+      // A vendored add-on still imports the bare specifier `three`, which no
+      // browser can resolve. Derive an import map from the same URLs so the
+      // library's own module graph closes.
+      const map = await buildImportMap(
+        [...okUrls].map((u) => vendorPathFor(u).split(path.sep).join('/')),
+        (rel) => fs.readFile(path.join(vendorRoot, rel), 'utf8').catch(() => null),
+      );
+      if (map.unmapped.length) {
+        warn(`could not map bare import(s): ${map.unmapped.join(', ')}`);
+      }
+      working = injectImportMap(working, map.imports);
+      working = rewriteCdnUrls(working, { only: okUrls }).html;
     }
 
     const html = injectRuntime(working, {
@@ -528,7 +597,12 @@ export function createStaticHandler({ root, liveReload, vendorRoot, onVendor }) 
 
     if (urlPath === SSE_PATH) {
       if (hub) {
-        hub.attach(req, res, urlPath);
+        // attach() returns false at the client cap. Ignoring that left the
+        // socket open with no response at all: over-cap requests hung forever
+        // and pinned an fd until the client gave up.
+        if (!hub.attach(req, res, urlPath)) {
+          sendText(res, 503, 'too many live-reload clients', 'text/plain; charset=utf-8', { 'Retry-After': '2' });
+        }
       } else {
         // With live reload disabled there is no stream to attach. Returning
         // without responding left the browser waiting on a socket that would
@@ -686,7 +760,11 @@ export function createServer(config) {
 
       // ---- live reload stream (dashboard)
       if (urlPath === SSE_PATH) {
-        controller.bus.attach(req, res, urlPath);
+        if (!controller.bus.attach(req, res, urlPath)) {
+          sendJson(res, 503, { error: 'too many live-reload clients' }, { 'Retry-After': '2' });
+          log(503);
+          return;
+        }
         log(200);
         return;
       }
@@ -883,7 +961,7 @@ export function createServer(config) {
       vendorRoot: config.vendorPath,
       onVendor: async (urls) => {
         const { vendorAll } = await import('./lib/vendor.mjs');
-        await vendorAll(urls, config.vendorPath, {
+        return vendorAll(urls, config.vendorPath, {
           log: (m) => { if (!config.quiet) info(m); },
         });
       },
@@ -1007,11 +1085,20 @@ function readBody(req, limit = 4 * 1024 * 1024) {
         resolve({});
         return;
       }
+      let parsed;
       try {
-        resolve(JSON.parse(Buffer.concat(chunks).toString('utf8')));
+        parsed = JSON.parse(Buffer.concat(chunks).toString('utf8'));
       } catch {
         reject(new EditorError('invalid JSON body', 400));
+        return;
       }
+      // `null`, `"str"`, `[]` and `42` all parse. Reading `.dir` off one threw a
+      // TypeError that surfaced as a 500 with an internal message.
+      if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        reject(new EditorError(`body must be a JSON object, got ${Array.isArray(parsed) ? 'array' : JSON.stringify(parsed)}`, 400));
+        return;
+      }
+      resolve(parsed);
     });
 
     req.on('error', reject);
@@ -1114,7 +1201,10 @@ async function handleFileApi(action, req, res, log, controller) {
  * exactly the set a user would expect to edit here.
  */
 function assertKnownProject(controller, dir) {
-  const abs = path.resolve(String(dir ?? ''));
+  if (typeof dir !== 'string' || !dir.trim()) {
+    throw new EditorError('field "dir" is required and must be a string', 400);
+  }
+  const abs = path.resolve(dir);
   const known = controller.projects.some((p) => p.dir === abs);
   if (!known) {
     throw new EditorError(`not an editable project: ${abs}`, 403);
@@ -1125,7 +1215,7 @@ function assertKnownProject(controller, dir) {
 async function vendorAllFor(urls, contextPath) {
   const config = loadConfig();
   const { vendorAll } = await import('./lib/vendor.mjs');
-  await vendorAll(urls, config.vendorPath, { log: (m) => info(`${path.basename(contextPath)}: ${m}`) });
+  return vendorAll(urls, config.vendorPath, { log: (m) => info(`${path.basename(contextPath)}: ${m}`) });
 }
 
 // ---------------------------------------------------------------- startup
@@ -1201,7 +1291,15 @@ async function controllerInit(config, server) {
 const isMain = process.argv[1] && path.resolve(process.argv[1]) === SELF;
 
 if (isMain) {
-  const config = loadConfig();
+  let config;
+  try {
+    config = loadConfig();
+  } catch (error) {
+    // A bad flag is the user's typo, not a crash. Print the message and stop.
+    console.error(`${useColor ? '\x1b[31m' : ''}error${useColor ? '\x1b[0m' : ''}  ${error.message}`);
+    if (error instanceof ConfigError && error.hint) console.error(`hint   ${error.hint}`);
+    process.exit(2);
+  }
 
   if (config.help) {
     console.log(USAGE.trim());

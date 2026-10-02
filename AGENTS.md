@@ -71,6 +71,8 @@ lib/vendor.mjs          CDN allowlist, download, and URL rewriting
 lib/editor.mjs          file CRUD for the dashboard editor (security boundary)
 lib/editor-ui.mjs       editor markup, styles, and client behaviour
 lib/settings.mjs        persisted roots/port in ~/.crucible/config.json
+lib/http-guard.mjs      loopback Host, same-origin Origin, JSON-only bodies
+lib/import-map.mjs       import maps so vendored module graphs resolve
 lib/html.mjs            escaping, metadata extraction, runtime injection
 lib/mime.mjs            content types
 public/runtime/         browser runtime injected into served pages
@@ -132,6 +134,9 @@ Two more traps in this suite:
 
 - Node's `fetch` (undici) silently ignores the `Host` header, so a DNS-rebinding
   test written with it proves nothing. Use a raw socket.
+- Never assert on `process.getActiveResourcesInfo()` for a specific handle
+  name: it differs per platform (FSEventWrap vs INotifyWrap) and can be absent
+  entirely. Assert on observable behaviour instead.
 - `for await` over a request stream destroys the stream when the loop exits
   early, resetting the socket mid-upload. `readBody` is event-based and drains
   the remainder instead; do not reintroduce `for await` there.

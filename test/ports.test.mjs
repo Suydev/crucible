@@ -9,6 +9,8 @@ import {
   DEFAULT_PORT,
   PORT_RANGE_START,
   PORT_RANGE_END,
+  BROWSER_BLOCKED_PORTS,
+  isBrowserSafe,
   preferredPortFor,
   candidatePortsFor,
   isPortFree,
@@ -113,4 +115,47 @@ test('allocatePort walks forward when the preferred port is taken', async () => 
 
 test('default port is the documented one', () => {
   assert.equal(DEFAULT_PORT, 5050);
+});
+
+
+// ---------------------------------------------------------------- browser-safe ports
+
+test('no preferred port is one a browser refuses to open', () => {
+  // Chromium blocks a set of ports (SIP and friends) inside our own range.
+  // A folder hashing onto one produced a green "live" URL in the dashboard
+  // that curl fetched but no browser would load.
+  const dirs = [
+    '/root/keyforge/web', '/root/isotope-code/docs', '/root/isotope-apk/www',
+    '/root/crucible/simulations', '/root/a', '/root/b', '/root/c',
+  ];
+  for (const dir of dirs) {
+    const port = preferredPortFor(dir);
+    assert.ok(isBrowserSafe(port), `${dir} derived blocked port ${port}`);
+    assert.ok(port >= PORT_RANGE_START && port <= PORT_RANGE_END);
+  }
+});
+
+test('5060 and 5061 are excluded as candidates', () => {
+  assert.equal(isBrowserSafe(5060), false);
+  assert.equal(isBrowserSafe(5061), false);
+  assert.equal(isBrowserSafe(5050), true);
+
+  const candidates = candidatePortsFor('/root/isotope-code/docs', 150);
+  for (const port of candidates) {
+    assert.ok(isBrowserSafe(port), `candidate ${port} is browser-blocked`);
+  }
+});
+
+test('the blocked list stays inside the managed range or is documented', () => {
+  // Guard against someone adding an out-of-range entry by accident.
+  for (const port of BROWSER_BLOCKED_PORTS) {
+    assert.equal(typeof port, 'number');
+  }
+  assert.ok(BROWSER_BLOCKED_PORTS.has(5060));
+});
+
+test('shifting off a blocked port stays deterministic', () => {
+  const dir = '/root/keyforge/web';
+  assert.equal(preferredPortFor(dir), preferredPortFor(dir));
+  assert.notEqual(preferredPortFor(dir), 5060);
 });

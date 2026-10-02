@@ -142,8 +142,12 @@ simHost.toast('saved');
 simHost.warn('careful');
 ```
 
-`fs.watch` drives reloads, with a five-second mtime poll as a fallback for
-filesystems where inotify is unreliable. Measured idle cost: **0.24% of a core**.
+`fs.watch` drives reloads. A one-minute mtime poll is a fallback for filesystems
+where inotify is unreliable - it only polls that fast when `fs.watch` could not
+be armed at all, because re-walking the tree costs roughly a millisecond per
+file and would otherwise dominate idle CPU.
+
+Measured idle cost over a 200-file tree: **0.01% of a core**.
 
 ## Dependency vendoring
 
