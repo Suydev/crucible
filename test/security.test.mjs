@@ -227,3 +227,98 @@ test('stopDir on an unregistered directory returns immediately without signallin
 
   await fs.rm(base, { recursive: true, force: true });
 });
+
+
+// ---------------------------------------------------------------- http guard
+
+test('loopback Host headers are accepted, everything else refused', async () => {
+  const { isLoopbackHost } = await import('../lib/http-guard.mjs');
+  for (const host of ['localhost:5050', '127.0.0.1:5050', '[::1]:5050', 'LOCALHOST:5050']) {
+    assert.equal(isLoopbackHost(host, 5050), true, `${host} should be accepted`);
+  }
+  for (const host of ['attacker.example', 'evil.localhost', '127.0.0.1.evil.com', '', undefined]) {
+    assert.equal(isLoopbackHost(host, 5050), false, `${host} should be refused`);
+  }
+});
+
+test('a cross-origin Origin header is detected', async () => {
+  const { checkOrigin } = await import('../lib/http-guard.mjs');
+  const ok = { headers: { origin: 'http://127.0.0.1:5050', host: '127.0.0.1:5050' } };
+  assert.equal(checkOrigin(ok), null, 'same-origin must be allowed');
+
+  const evil = { headers: { origin: 'http://evil.example', host: '127.0.0.1:5050' } };
+  assert.match(checkOrigin(evil), /cross-origin/);
+
+  // Sec-Fetch-Site cannot be forged by page script, so it is the strong signal.
+  const rebind = { headers: { host: '127.0.0.1:5050', 'sec-fetch-site': 'cross-site' } };
+  assert.match(checkOrigin(rebind), /cross-site/);
+});
+
+test('only application/json bodies are accepted by the API', async () => {
+  const { isJsonRequest } = await import('../lib/http-guard.mjs');
+  assert.equal(isJsonRequest({ headers: { 'content-type': 'application/json' } }), true);
+  assert.equal(isJsonRequest({ headers: { 'content-type': 'application/json; charset=utf-8' } }), true);
+  // text/plain is a CORS-simple content type: it needs no preflight, which is
+  // exactly why it must not be enough to write a file.
+  assert.equal(isJsonRequest({ headers: { 'content-type': 'text/plain' } }), false);
+  assert.equal(isJsonRequest({ headers: {} }), false);
+});
+
+test('the API guard rejects a bad Host before anything else', async () => {
+  const { guardApiRequest } = await import('../lib/http-guard.mjs');
+  const bad = { method: 'POST', headers: { host: 'attacker.example', 'content-type': 'application/json' } };
+  assert.match(guardApiRequest(bad, 5050), /invalid Host/);
+
+  const good = {
+    method: 'POST',
+    headers: { host: '127.0.0.1:5050', origin: 'http://127.0.0.1:5050', 'content-type': 'application/json', 'content-length': '2' },
+  };
+  assert.equal(guardApiRequest(good, 5050), null, 'a legitimate request must pass');
+});
+
+test('the SSE client cap is enforced', async () => {
+  const { LiveReloadHub, MAX_CLIENTS } = await import('../lib/live-reload.mjs');
+  assert.ok(MAX_CLIENTS > 0 && MAX_CLIENTS <= 128, 'a sane cap');
+
+  const hub = new LiveReloadHub({ heartbeatMs: 60_000 });
+  const fakeRes = () => ({
+    writeHead: () => {}, setHeader: () => {}, write: () => true, end: () => {}, on: () => {}, writableLength: 0,
+  });
+  const fakeReq = () => ({ socket: { setNoDelay: () => {} }, on: () => {}, once: () => {} });
+
+  let accepted = 0;
+  for (let i = 0; i < MAX_CLIENTS + 5; i += 1) {
+    if (hub.attach(fakeReq(), fakeRes())) accepted += 1;
+  }
+  assert.equal(accepted, MAX_CLIENTS, 'must stop accepting past the cap');
+  hub.closeAll();
+});
+
+test('a slow SSE client is dropped rather than buffered without bound', async () => {
+  const { LiveReloadHub } = await import('../lib/live-reload.mjs');
+  const hub = new LiveReloadHub({ heartbeatMs: 60_000 });
+  const slow = {
+    writeHead: () => {}, setHeader: () => {}, write: () => true, end: () => {}, on: () => {}, writableLength: 10 * 1024 * 1024,
+  };
+  hub.attach({ socket: { setNoDelay: () => {} }, on: () => {}, once: () => {} }, slow);
+
+  // The greeting itself is the first send, so a peer that is already far behind
+  // is evicted immediately rather than after it has buffered more frames.
+  assert.equal(hub.size, 0, 'a client with a huge buffer must be dropped, not buffered');
+
+  // A healthy client is kept, so the cap cannot evict everyone.
+  const healthy = {
+    writeHead: () => {}, setHeader: () => {}, write: () => true, end: () => {}, on: () => {}, writableLength: 0,
+  };
+  hub.attach({ socket: { setNoDelay: () => {} }, on: () => {}, once: () => {} }, healthy);
+  assert.equal(hub.size, 1);
+  hub.broadcast('reload', { reason: 'test' });
+  assert.equal(hub.size, 1, 'a healthy client must survive a broadcast');
+  hub.closeAll();
+});
+
+test('vendor URLs must be https', async () => {
+  assert.equal(isVendorable('http://unpkg.com/three@0.128.0/build/three.min.js'), false,
+    'cleartext fetch would let a network attacker substitute the script');
+  assert.equal(isVendorable('https://unpkg.com/three@0.128.0/build/three.min.js'), true);
+});

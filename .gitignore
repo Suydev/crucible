@@ -1,5 +1,6 @@
 # Runtime state
-.sim-host/
+.crucible/
+node_modules/
 
 # Vendored CDN dependencies, fetched on demand and pinned in vendor/manifest.json
 vendor/

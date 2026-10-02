@@ -41,7 +41,7 @@ cat >> ~/.bash_aliases <<'EOF'
 host() { bash "$HOME/crucible/scripts/host.sh" "$@"; }
 hs()   { bash "$HOME/crucible/scripts/host.sh" --stop >/dev/null 2>&1; bash "$HOME/crucible/scripts/host.sh" "$@"; }
 ha()   { bash "$HOME/crucible/scripts/host.sh" --stop-all; }
-EOF'
+EOF
 
 source ~/.bashrc
 ```

@@ -9,12 +9,12 @@
 | `--roots <a,b>` | home directory | Comma-separated storage roots to scan |
 | `--root <dir>` | repo root | Directory served in `--single` mode |
 | `--single` | off | Serve `--root` directly, no dashboard |
-| `--vendor-root <d>` | `vendor` | Vendor cache directory |
+| `--vendor-root <d>` | `vendor` | Vendor cache directory (must be absolute, or relative to the repo) |
 | `--no-reload` | off | Disable SSE live reload |
 | `--list` | — | Print discovered projects and ports, then exit |
 | `-q, --quiet` | off | Suppress request logging |
 | `-v, --verbose` | off | Log file-watch activity |
-| `-h, --help` | — | Show usage |
+| `--help` | — | Show usage |
 
 Flags accept both `--port 8080` and `--port=8080`.
 
@@ -116,6 +116,23 @@ simHost.onBeforeReload(() => saveState()); // run before an automatic reload
 | `Tab` | Insert two spaces |
 | `r` | Rescan storage |
 
+## CDN allowlist
+
+Only these hosts may be vendored, over HTTPS only:
+
+| Host | Used for |
+| --- | --- |
+| `unpkg.com` | npm packages |
+| `cdn.jsdelivr.net` | npm packages |
+| `cdnjs.cloudflare.com` | cdnjs libraries |
+| `esm.sh` | ES module builds |
+| `skypack.dev`, `cdn.skypack.dev` | ES module builds |
+
+Anything else is refused with `403`. This is a security boundary rather than a
+proxy: an unrestricted fetcher could be pointed at internal addresses.
+Redirects are followed manually and re-validated against this list at each hop,
+so an allowlisted host cannot bounce the fetcher somewhere else.
+
 ## Editor file rules
 
 The editor can only touch these extensions:
@@ -131,6 +148,33 @@ project, so pointing the editor at an arbitrary directory returns 403.
 
 To edit something outside that set - a shell script, a Python file - use your
 normal editor. The dashboard editor is for the HTML/JS simulations it serves.
+
+## HTTP API
+
+Everything under `/__simhost/api/` is same-origin only. Requests are refused
+unless the `Host` header names loopback, the `Origin` matches, and a body is
+sent as `Content-Type: application/json`. A plain `text/plain` POST from another
+web page needs no CORS preflight and would otherwise be able to write files.
+
+| Endpoint | Method | Purpose |
+| --- | --- | --- |
+| `/api/state` | GET | Tree, projects, and live instances |
+| `/api/rescan` | POST | Rescan storage now |
+| `/api/host` | POST | Start a host: `{dir, port?}` |
+| `/api/stop` | POST | Stop a host: `{dir}` |
+| `/api/file/list` | GET | Editable files in a project: `?dir=` |
+| `/api/file/read` | GET | One file: `?dir=&name=` |
+| `/api/file/save` | POST | Write: `{dir, name, content}` |
+| `/api/file/create` | POST | Create: `{dir, name, template?}` |
+| `/api/file/delete` | POST | Delete: `{dir, name}` |
+| `/api/file/rename` | POST | Rename: `{dir, from, to}` |
+
+Errors are always `{"error": "<reason>"}`. Status codes: `400` invalid request,
+`403` refused by a gate, `404` absent, `405` wrong method (with `Allow`),
+`409` rename collision, `413` too large, `500` fault.
+
+`port` is ignored unless it falls inside 5050-5199, so the API cannot make a
+host squat on an arbitrary local port.
 
 ## Browser behaviour
 

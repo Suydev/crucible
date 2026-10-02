@@ -4,7 +4,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { parseArgs, loadConfig } from '../lib/config.mjs';
+import { parseArgs, loadConfig, ROOT } from '../lib/config.mjs';
 
 test('parseArgs handles --key value', () => {
   assert.equal(parseArgs(['--port', '8080']).port, 8080);
@@ -52,7 +52,10 @@ test('vendor cache is shared, not per served directory', () => {
   const a = loadConfig(['--single', '--root', '/tmp/one'], {});
   const b = loadConfig(['--single', '--root', '/tmp/two'], {});
   assert.equal(a.vendorPath, b.vendorPath, 'cache must not depend on the served directory');
-  assert.ok(!a.vendorPath.startsWith('/tmp/'), 'cache must not live under the served dir');
+  // Assert the property, not a hardcoded path. The old check hardcoded /tmp and
+  // therefore failed for anyone who cloned the repo under /tmp or /var/tmp.
+  assert.ok(a.vendorPath.startsWith(ROOT), `cache should live inside the repo, got ${a.vendorPath}`);
+  assert.ok(!a.vendorPath.startsWith(a.root), 'cache must not live under the served dir');
 });
 
 test('registry path is inside the sim-host repo', () => {

@@ -7,7 +7,7 @@
 //
 // Responsibilities:
 //   1. Serve the dashboard at / - browse storage, start/stop hosts per folder.
-//   2. Spawn a child sim-host process per hosted directory, each on its own
+//   2. Spawn a child crucible process per hosted directory, each on its own
 //      port derived deterministically from its absolute path.
 //   3. Serve single-project mode directly when --root points at a simulations
 //      folder (the original, simpler behaviour).
@@ -47,8 +47,11 @@ import {
   allocatePort,
   isPortFree,
   preferredPortFor,
+  PORT_RANGE_START,
+  PORT_RANGE_END,
 } from './lib/ports.mjs';
 import { scanWorkspace } from './lib/workspace.mjs';
+import { guardApiRequest } from './lib/http-guard.mjs';
 import {
   EditorError,
   deleteFile,
@@ -104,8 +107,9 @@ function sendText(res, status, body, type = 'text/plain; charset=utf-8', extra =
   res.end(payload);
 }
 
-function sendJson(res, status, data) {
-  sendText(res, status, JSON.stringify(data), 'application/json; charset=utf-8');
+/** JSON response. `extra` carries headers such as Allow on a 405. */
+function sendJson(res, status, data, extra = {}) {
+  sendText(res, status, JSON.stringify(data), 'application/json; charset=utf-8', extra);
 }
 
 /**
@@ -201,7 +205,20 @@ export class HostController {
     return this;
   }
 
+  /**
+   * Single-flighted. N concurrent callers share one walk instead of each
+   * starting a full-home-directory scan; 40 parallel rescans previously cost
+   * seconds of CPU and ~27 MB of RSS for a single set of results.
+   */
   async rescan() {
+    if (this.rescanInFlight) return this.rescanInFlight;
+    this.rescanInFlight = this.#rescan().finally(() => {
+      this.rescanInFlight = null;
+    });
+    return this.rescanInFlight;
+  }
+
+  async #rescan() {
     const { buildTree } = await import('./lib/workspace.mjs');
     this.projects = await scanWorkspace(this.roots, {
       portFor: preferredPortFor,
@@ -462,7 +479,40 @@ export function createStaticHandler({ root, liveReload, vendorRoot, onVendor }) 
     sendText(res, 200, html, 'text/html; charset=utf-8');
   }
 
+  /**
+   * Refuses to serve through a symlink that points outside the served root.
+   *
+   * isInside() is purely lexical, so it happily accepted a link sitting inside
+   * the root that resolved elsewhere - dropping one such file into a project
+   * (a clone, an unzip, a tarball) turned every reachable file into a served
+   * file. The editor got this check in an earlier audit; the static server did
+   * not.
+   */
+  async function assertServable(absPath) {
+    let link;
+    try {
+      link = await fs.lstat(absPath);
+    } catch {
+      return false;
+    }
+    if (link.isSymbolicLink()) {
+      let real;
+      try {
+        real = await fs.realpath(absPath);
+      } catch {
+        return false;
+      }
+      const realRoot = await fs.realpath(root).catch(() => path.resolve(root));
+      if (!isInside(realRoot, real) && real !== realRoot) return false;
+    }
+    return true;
+  }
+
   async function serveFile(req, res, absPath) {
+    if (!(await assertServable(absPath))) {
+      sendText(res, 403, 'Forbidden');
+      return;
+    }
     let stat;
     try {
       stat = await fs.stat(absPath);
@@ -556,6 +606,12 @@ export function createStaticHandler({ root, liveReload, vendorRoot, onVendor }) 
       return;
     }
 
+    // A directory component can itself be a symlink out of the root.
+    if (!(await assertServable(abs))) {
+      sendText(res, 403, 'Forbidden');
+      return;
+    }
+
     if (stat.isDirectory()) {
       const index = path.join(abs, 'index.html');
       try {
@@ -615,6 +671,19 @@ export function createServer(config) {
         return;
       }
 
+      // ---- cross-origin guard
+      // Without this, any page the user visits could POST to the editor with
+      // text/plain (a CORS-simple request needing no preflight) and write files.
+      if (urlPath.startsWith('/__simhost/api/') || urlPath === '/__simhost/reload') {
+        const refused = guardApiRequest(req, config.port);
+        if (refused) {
+          err(`blocked cross-origin request: ${refused}`);
+          sendJson(res, 403, { error: 'request refused' });
+          log(403);
+          return;
+        }
+      }
+
       // ---- live reload stream (dashboard)
       if (urlPath === SSE_PATH) {
         controller.bus.attach(req, res, urlPath);
@@ -632,6 +701,15 @@ export function createServer(config) {
           return;
         }
 
+        const ROUTES = {
+          state: 'GET', rescan: 'POST', host: 'POST', stop: 'POST',
+        };
+        if (ROUTES[action] && req.method !== ROUTES[action]) {
+          sendJson(res, 405, { error: `${action} requires ${ROUTES[action]}` }, { Allow: ROUTES[action] });
+          log(405);
+          return;
+        }
+
         if (action === 'rescan' && req.method === 'POST') {
           const projects = await controller.rescan();
           sendJson(res, 200, { ok: true, count: projects.length });
@@ -643,7 +721,7 @@ export function createServer(config) {
           const body = await readBody(req);
           let result;
           try {
-            result = await controller.hostDir(body.dir, { preferredPort: body.port ?? null });
+            result = await controller.hostDir(body.dir, { preferredPort: validatedPort(body.port) });
           } catch (err) {
             // A rejected directory is a client error, not a server fault.
             // Reporting 500 made a rejected request look like a crash.
@@ -685,7 +763,7 @@ export function createServer(config) {
           return;
         }
 
-        sendJson(res, 404, { error: 'unknown action' });
+        sendJson(res, 404, { error: `unknown action: ${action}` });
         log(404);
         return;
       }
@@ -847,21 +925,98 @@ export function createServer(config) {
   return server;
 }
 
-/** Reads and parses a JSON request body, bounded to avoid abuse. */
-async function readBody(req, limit = 4 * 1024 * 1024) {
-  const chunks = [];
-  let size = 0;
-  for await (const chunk of req) {
-    size += chunk.length;
-    if (size > limit) throw new EditorError('request body too large', 413);
-    chunks.push(chunk);
-  }
-  if (!chunks.length) return {};
+/**
+ * Restricts an explicitly requested port to the range the tool manages.
+ *
+ * preferredPort used to be passed straight through and tried first, so any page
+ * that could reach the API could make a host squat on port 9000 or a browser
+ * debugging port. Ports outside 5050-5199 are now ignored in favour of the
+ * deterministic assignment.
+ */
+function validatedPort(requested) {
+  if (requested == null || requested === '') return null;
+  const port = Number(requested);
+  if (!Number.isInteger(port)) return null;
+  if (port < PORT_RANGE_START || port > PORT_RANGE_END) return null;
+  return port;
+}
+
+/**
+ * Binds the server and turns the two failures a user can actually cause into a
+ * one-line message. The raw Node stack for EADDRINUSE named a file and line
+ * rather than the thing to change.
+ */
+async function listen(server, config) {
   try {
-    return JSON.parse(Buffer.concat(chunks).toString('utf8'));
-  } catch {
-    throw new EditorError('invalid JSON body', 400);
+    await new Promise((resolve, reject) => {
+      server.once('error', reject);
+      server.listen(config.port, config.host, resolve);
+    });
+  } catch (error) {
+    if (error.code === 'EADDRINUSE') {
+      throw new Error(
+        `port ${config.port} is already in use on ${config.host}.\n`
+        + `  another host is probably running: host --status\n`
+        + `  or pick another port: node server.mjs --port ${config.port + 1}`,
+      );
+    }
+    if (error.code === 'EACCES') {
+      throw new Error(`not allowed to bind ${config.host}:${config.port} (ports below 1024 need root)`);
+    }
+    throw error;
   }
+}
+
+/**
+ * Reads and parses a JSON request body, bounded to avoid abuse.
+ *
+ * Deliberately event-based rather than `for await`. Breaking out of a
+ * `for await` on a request stream calls the iterator's return(), which destroys
+ * the stream and resets the socket while the peer is still uploading. Both a
+ * bare throw and a follow-up resume() then leave the connection unusable, so
+ * every later request on it died with ECONNRESET and the oversized upload
+ * itself hung.
+ *
+ * Instead the remainder is read to completion and discarded. Memory stays flat
+ * because the overflowing chunks are never retained.
+ */
+function readBody(req, limit = 4 * 1024 * 1024) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let size = 0;
+    let overflow = false;
+
+    req.on('data', (chunk) => {
+      size += chunk.length;
+      if (size > limit) {
+        if (!overflow) {
+          overflow = true;
+          chunks.length = 0;
+        }
+        return; // discard, but keep draining
+      }
+      chunks.push(chunk);
+    });
+
+    req.on('end', () => {
+      if (overflow) {
+        reject(new EditorError(`request body too large (${Math.round(size / 1024)} kB, max ${limit / 1024} kB)`, 413));
+        return;
+      }
+      if (!chunks.length) {
+        resolve({});
+        return;
+      }
+      try {
+        resolve(JSON.parse(Buffer.concat(chunks).toString('utf8')));
+      } catch {
+        reject(new EditorError('invalid JSON body', 400));
+      }
+    });
+
+    req.on('error', reject);
+    req.on('aborted', () => reject(new EditorError('request aborted', 400)));
+  });
 }
 
 /**
@@ -940,6 +1095,15 @@ async function handleFileApi(action, req, res, log, controller) {
     const code = error instanceof EditorError ? error.status : 500;
     if (code >= 500) err(`editor ${action}: ${error.message}`);
     sendJson(res, code, { error: error.message });
+    // A body rejected mid-upload is still arriving. Leaving it there poisons
+    // the keep-alive socket: the next request on that connection reads the
+    // leftover bytes and dies with ECONNRESET.
+    //
+    // resume() discards the remainder rather than buffering it, so memory stays
+    // flat no matter how large the rejected body was. Destroying the socket
+    // instead resets the connection while the peer is still writing, which
+    // hangs the client - so drain, never destroy.
+    if (!req.readableEnded) req.resume();
     status(code);
   }
 }
@@ -975,10 +1139,7 @@ export async function start(config) {
   const server = createServer(config);
 
   if (config.single) {
-    await new Promise((resolve, reject) => {
-      server.once('error', reject);
-      server.listen(config.port, config.host, resolve);
-    });
+    await listen(server, config);
     server.watchDir?.();
 
     const base = `http://${config.host}:${config.port}`;
@@ -998,16 +1159,13 @@ export async function start(config) {
   await controllerInit(config, server);
   server.controller.watch();
 
-  await new Promise((resolve, reject) => {
-    server.once('error', reject);
-    server.listen(config.port, config.host, resolve);
-  });
+  await listen(server, config);
 
   if (!config.quiet) {
     const base = `http://${config.host}:${config.port}`;
     const projects = server.controller.projects;
     console.log('');
-    console.log(`${C.bold}sim-host${C.reset}  ${C.dim}control dashboard${C.reset}`);
+    console.log(`${C.bold}crucible${C.reset}  ${C.dim}control dashboard${C.reset}`);
     console.log('');
     ok(`dashboard  ${C.cyan}${base}/${C.reset}`);
     ok(`${projects.length} project${projects.length === 1 ? '' : 's'} across ${config.roots.length} root${config.roots.length === 1 ? '' : 's'}`);

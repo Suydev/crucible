@@ -45,7 +45,7 @@ There is no build step and no npm install. Do not add one.
 
 These cost real debugging time. They are properties of the sandbox, not the code.
 
-- **There is no `ss` and no `netstat`.** Do not shell out to them.
+- **There is no `ss`. `netstat` may exist but prints an empty table here.** Do not shell out to them.
 - **`/proc/net/tcp` is not readable** (permission denied), so socket-to-pid
   mapping via `/proc` is impossible.
 - **`lsof` and `fuser` fail** for the same reason - they read `/proc/net`.
@@ -124,6 +124,17 @@ Two traps that have already bitten this suite:
 When a refactor changes a function signature used by the request path, add a
 real HTTP test. `test/serve.test.mjs` exists because a signature change once
 made every static asset return HTTP 500 while all 100+ unit tests passed.
+`test/api.test.mjs` exists for the same reason on the API side: deleting every
+`assertKnownProject()` call in `handleFileApi` - opening arbitrary-directory
+write, create, delete and rename - passed the whole suite.
+
+Two more traps in this suite:
+
+- Node's `fetch` (undici) silently ignores the `Host` header, so a DNS-rebinding
+  test written with it proves nothing. Use a raw socket.
+- `for await` over a request stream destroys the stream when the loop exits
+  early, resetting the socket mid-upload. `readBody` is event-based and drains
+  the remainder instead; do not reintroduce `for await` there.
 
 ## Verifying changes
 
