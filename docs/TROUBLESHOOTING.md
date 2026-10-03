@@ -107,6 +107,60 @@ host --roots ~/projects
 Hard skips (never descended into) include `node_modules`, `.git`, `dist`,
 `build`, `target`, `.next`, `.nuxt`, and all dot-directories.
 
+## A library loads but nothing renders, with no error
+
+Check the Content-Type the vendored file is served with:
+
+```bash
+curl -sD- -o/dev/null "http://localhost:PORT/__simhost/vendor/<host>/<path>" | grep -i content-type
+```
+
+Anything that is not `text/javascript` fails module loading in Chromium before
+a single line of the library runs, and the browser reports it as a MIME error
+rather than a dependency problem. An extensionless CDN URL
+(`esm.sh/three@0.128.0`, jsdelivr `/+esm`) is the usual culprit - it has no file
+extension, so extension-based lookup returns `application/octet-stream`.
+
+## "Failed to resolve module specifier"
+
+The vendored module imports a bare specifier the import map does not cover.
+Usually this means the package entered the graph only as a dependency of
+something else, and its own entry was never referenced by URL.
+
+The console lists which imports went unmapped. Anchor the package by naming its
+URL somewhere in the page:
+
+```html
+<script type="module" src="https://unpkg.com/three@0.128.0/build/three.module.js"></script>
+```
+
+## Only the first file of a library works; the rest 404
+
+The page is loading a library whose modules reference each other by relative or
+root-absolute path. Both are handled: the cache preserves upstream's directory
+layout, and root-absolute paths are rewritten at serve time. If sub-resources
+still 404, clear the cache and reload - a stale cache can hold a file cached
+before a path scheme changed:
+
+```bash
+rm -rf vendor/
+```
+
+## The first load takes several seconds, then it is instant
+
+Expected on a cold cache. The whole graph is downloaded before the document is
+served, which is what makes the page work offline. A large graph - d3 pulls
+around 44 files - measures roughly 4-9s on a decent connection. Later loads
+read from cache.
+
+## A dependency stays online and the page needs the network
+
+Either the download failed, or the host is not allowlisted. Both are reported on
+the server console when not quiet: `vendor failed: <url> - <reason>` and
+`N dependency/dependencies unavailable; left as remote URLs`. A URL left remote
+is deliberately not rewritten, so the page keeps loading but falls back to the
+CDN.
+
 ## Port probing fails in this sandbox
 
 This machine has no `ss` and no `netstat`, and `/proc/net/tcp` is not readable,

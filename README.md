@@ -18,9 +18,9 @@ three.
 - **Ports that never move.** Each folder's port is derived from its absolute
   path, so the same folder always lands on the same port. Bookmark it. Run
   twelve projects at once without thinking about it.
-- **Dependencies that just work.** A page loading three.js from unpkg gets it
-  downloaded once into a local cache and rewritten to a local path. Afterwards
-  it works offline, with the version still pinned.
+- **Dependencies that just work.** Point a simulation at a library on any
+  major CDN and the whole dependency graph is downloaded, rewritten, and cached.
+  Afterwards it runs offline, with the version still pinned.
 - **An editor in the browser.** Create, edit, rename, and delete files without
   leaving the dashboard, with a split preview against the live server.
 
@@ -166,8 +166,18 @@ Downloaded on first request and cached in `vendor/`, shared across every hosted
 project so a library is stored once. `vendor/manifest.json` records the SHA-256
 of each file, so you can tell exactly what is on disk.
 
-Allowlisted: unpkg, jsDelivr, cdnjs, esm.sh, skypack. Anything else is refused -
-this is a security boundary, not a proxy. Clear the cache with `rm -rf vendor/`.
+Not just the URL you named: the entire reachable graph is downloaded and
+cached, so an addon that imports something else works too. Bare imports such as
+`from 'three'` are resolved by a generated import map, and the same map covers
+dependencies declared in your own `.js` files.
+
+Allowlisted: unpkg, jsDelivr, cdnjs, esm.sh, esm.run, skypack, jspm. HTTPS only,
+with every redirect hop re-validated. Anything else is refused - this is a
+security boundary, not a proxy. See
+[Configuration](docs/CONFIGURATION.md#what-gets-downloaded) for the full
+behaviour, including graph bounds and cold-start cost.
+
+Clear the cache with `rm -rf vendor/`; the next load re-downloads.
 
 ## Settings
 

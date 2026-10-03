@@ -118,20 +118,75 @@ simHost.onBeforeReload(() => saveState()); // run before an automatic reload
 
 ## CDN allowlist
 
-Only these hosts may be vendored, over HTTPS only:
+Only these hosts may be vendored, and only over HTTPS:
 
-| Host | Used for |
+| Host | Used for | Shape it serves |
+| --- | --- | --- |
+| `unpkg.com` | npm packages | raw file, keeps bare specifiers |
+| `cdn.jsdelivr.net` | npm packages | `/npm/...` raw, `/+esm` re-export stub |
+| `cdnjs.cloudflare.com` | cdnjs libraries | raw file |
+| `esm.sh`, `esm.run` | ES module builds | tiny entry that re-exports origin-relative paths |
+| `skypack.dev`, `cdn.skypack.dev`, `cdn.skypack.io` | ES module builds | re-export stub |
+| `ga.jspm.io` | npm packages | raw ESM, keeps bare specifiers |
+
+Anything else is refused. This is a security boundary rather than a proxy: an
+unrestricted fetcher could be pointed at internal addresses. Redirects are
+followed manually and re-validated against this list at every hop, so an
+allowlisted host cannot bounce the fetcher somewhere else.
+
+There are three CDN shapes in the wild and each is handled differently:
+
+- **Raw file CDNs** (unpkg, jsDelivr `/npm/`, cdnjs, jspm) serve the package as
+  published. Bare specifiers such as `from 'three'` survive, and an import map
+  resolves them.
+- **Re-export stubs** (esm.sh, skypack, jsDelivr `/+esm`) serve a tiny entry that
+  re-exports origin-relative paths, e.g. `export * from '/npm/d3-array@3/+esm'`.
+  Served from your own origin those would resolve to your root and 404, so they
+  are rewritten to carry the vendor prefix.
+- **Extensionless URLs** (`esm.sh/three@0.128.0`, `/+esm`) have no file
+  extension. Chromium strict-checks MIME on module scripts, so they are served
+  as `text/javascript` regardless of their name.
+
+## What gets downloaded
+
+The whole reachable graph, not just the URLs the document names:
+
+1. CDN URLs are collected from the document **and** from every project-local
+   `<script type="module" src="...">` it loads, since a page's bare dependencies
+   often live in a module the document never reads.
+2. The graph is crawled breadth-first and each file is cached before the
+   document is served, so the page does not depend on the server being online
+   for the deeper modules.
+3. One import map is injected into the document covering bare specifiers across
+   the HTML and all local modules.
+
+Bounds, so a pathological dependency cannot hang a request:
+
+| Bound | Value |
 | --- | --- |
-| `unpkg.com` | npm packages |
-| `cdn.jsdelivr.net` | npm packages |
-| `cdnjs.cloudflare.com` | cdnjs libraries |
-| `esm.sh` | ES module builds |
-| `skypack.dev`, `cdn.skypack.dev` | ES module builds |
+| Files per graph | 600 |
+| Depth | 8 |
+| Parallel fetches | 8 |
 
-Anything else is refused with `403`. This is a security boundary rather than a
-proxy: an unrestricted fetcher could be pointed at internal addresses.
-Redirects are followed manually and re-validated against this list at each hop,
-so an allowlisted host cannot bounce the fetcher somewhere else.
+A walk that hits a bound logs which imports may have stayed remote.
+
+**Cold starts are not free.** A first load of a large graph pays for the whole
+download before the page is served - measured at roughly 4-9s for d3's 44-file
+graph depending on CDN response. Subsequent loads read from the cache.
+
+### Bare specifiers need an anchor
+
+`import * as THREE from 'three'` is resolved by the import map, which means the
+package must already be in the graph. A package enters the graph when some CDN
+URL for it appears in the document or a local module, for example:
+
+```html
+<script type="module" src="https://unpkg.com/three@0.128.0/build/three.module.js"></script>
+```
+
+A module that uses a bare specifier with no such URL anywhere is reported as an
+unmapped import rather than being guessed at. Naming the version explicitly is
+always safer than letting a resolver pick one.
 
 ## Editor file rules
 

@@ -127,15 +127,56 @@ disk are never written.
 
 ## Vendor pipeline
 
-1. `findCdnUrls` extracts allowlisted URLs from the document.
-2. `vendorAll` downloads anything not already cached, four at a time.
-3. Writes are atomic (temp file plus rename) so a crash cannot leave a
-   truncated file that later looks cached.
-4. `rewriteCdnUrls` maps each URL to `/__simhost/vendor/<host>/<path>`.
-5. `vendor/manifest.json` records SHA-256, byte size, and fetch time.
+The cache is a **faithful mirror of upstream** and every transform happens at
+serve time. A cached file is byte-identical to what the CDN sent, which is what
+makes the SHA-256 in `manifest.json` mean anything. The browser still receives a
+document it can run, because the two things it needs - a correct MIME type and
+rewritten specifiers - are applied on the way out.
 
-A cold request for a vendor path also fetches on demand, so a page that hardcodes
-a local vendor path works even if the rewrite never ran.
+On a request for an HTML document:
+
+1. `findCdnUrls` extracts allowlisted URLs from the document, and from every
+   project-local module it loads. A page's bare dependencies frequently live in
+   a module the document handler would otherwise never read.
+2. `crawlGraph` walks the reachable graph breadth-first, eight fetches in
+   flight, downloading each file into the cache. Doing this *before* responding
+   is what lets a page run with the server offline: fetching deeper modules
+   lazily at browser-request time left the page dependent on the server.
+3. `vendorOne` writes atomically (temp file plus rename), so a crash cannot
+   leave a truncated file that later looks cached.
+4. `buildImportMap` derives a single import map for bare specifiers across the
+   whole graph, and `injectImportMap` merges it into the document - in place,
+   if the author already wrote one.
+5. `rewriteCdnUrls` maps each URL to `/__simhost/vendor/<host>/<path>`.
+6. `vendor/manifest.json` records SHA-256, byte size, and fetch time.
+
+On a request for a vendor path, `rewriteModuleSource` fixes the specifier forms
+a browser cannot resolve on its own: root-absolute paths (which otherwise hit
+your origin) and absolute CDN URLs. Relative paths need no rewrite because the
+cache preserves upstream's directory layout.
+
+Three details that each caused a real failure:
+
+- **Extensionless URLs get a `.js` cache name.** An esm.sh entry caches as the
+  file `three@0.128.0` while its child needs that name to be a directory, and a
+  filesystem cannot be both. Naming it `three@0.128.0.js` removes the collision
+  and makes content-type lookup work without a heuristic.
+- **Query strings fold into a `__q<hash>` suffix.** A literal `?` in a filename
+  starts a query string, so the rewritten path could never match the cache.
+- **`remoteUrlFor` reads the manifest** to recover the original URL. Prefixing
+  `https://` to a cache path is wrong exactly when a query was folded in.
+
+A cold request for a vendor path still fetches on demand, so a page that
+hardcodes a local vendor path works even if the rewrite never ran.
+
+### Concurrency
+
+`crawlGraph` walks one BFS level at a time but fetches within a level
+concurrently. The traversal stays a true breadth-first walk, so the depth cap
+stays meaningful and the output order is deterministic; only the round trips
+overlap. Measured on a 44-file graph, this was the difference between 32.6s and
+1.9s. The bound is deliberately low because the CDN, not the server, is the
+bottleneck.
 
 ## The editor
 
