@@ -29,8 +29,8 @@ import { fileURLToPath } from 'node:url';
 import { spawn } from 'node:child_process';
 
 import { loadConfig, ConfigError, USAGE, ROOT } from './lib/config.mjs';
-import { contentTypeFor, isReloadSensitive } from './lib/mime.mjs';
-import { escapeHtml, injectRuntime } from './lib/html.mjs';
+import { contentTypeFor, isReloadSensitive, looksLikeVendorModule } from './lib/mime.mjs';
+import { escapeHtml, injectRuntime, findLocalModuleScripts } from './lib/html.mjs';
 import { scanSimulations } from './lib/scanner.mjs';
 import { renderDashboard } from './lib/dashboard.mjs';
 import { startWatching } from './lib/watcher.mjs';
@@ -42,6 +42,7 @@ import {
   vendorOne,
   findCdnUrls,
   isVendorable,
+  remoteUrlFor,
 } from './lib/vendor.mjs';
 import {
   InstanceRegistry,
@@ -54,6 +55,7 @@ import {
 import { scanWorkspace } from './lib/workspace.mjs';
 import { guardApiRequest } from './lib/http-guard.mjs';
 import { buildImportMap, injectImportMap } from './lib/import-map.mjs';
+import { crawlGraph, rewriteModuleSource } from './lib/vendor-graph.mjs';
 import {
   EditorError,
   deleteFile,
@@ -500,11 +502,36 @@ export class HostController {
 export function createStaticHandler({ root, liveReload, vendorRoot, onVendor }) {
   const hub = liveReload ? new LiveReloadHub() : null;
 
+  /** Resolves a document-relative script src to a path inside the root. */
+  function resolveLocalScript(value, urlPath) {
+    const fromUrl = value.startsWith('/')
+      ? value
+      : path.posix.join(path.posix.dirname(urlPath || '/'), value);
+    const abs = path.resolve(root, `.${safeDecode(fromUrl) ?? fromUrl}`);
+    return isInside(root, abs) ? abs : null;
+  }
+
   async function serveHtml(res, htmlPath, urlPath) {
     const raw = await fs.readFile(htmlPath, 'utf8');
 
     // Pull CDN deps into the local cache, then point the document at them.
+    // The seed set spans the HTML and every project module it loads, so one
+    // crawl covers bare specifiers declared at either level.
     const found = findCdnUrls(raw);
+    if (vendorRoot) {
+      // Seed the crawl with the module's dependencies too, so one map covers
+      // the document and every project module it loads.
+      for (const value of findLocalModuleScripts(raw)) {
+        const abs = resolveLocalScript(value, urlPath);
+        if (!abs) continue;
+        const source = await fs.readFile(abs, 'utf8').catch(() => null);
+        if (source == null) continue;
+        for (const url of findCdnUrls(source)) {
+          if (!found.includes(url)) found.push(url);
+        }
+      }
+    }
+
     let working = raw;
     if (found.length && vendorRoot) {
       const results = (await onVendor?.(found, htmlPath)) ?? [];
@@ -521,11 +548,30 @@ export function createStaticHandler({ root, liveReload, vendorRoot, onVendor }) 
         warn(`${stillRemote.length} dependency/dependencies unavailable; left as remote URLs`);
       }
 
+      // Crawl the FULL graph before answering. Previously only the entry files
+      // named in the HTML were downloaded and everything deeper was fetched
+      // lazily at browser-request time. That made the page depend on the server
+      // being online: with the whole stack offline, a relative sibling that was
+      // never pre-downloaded 502s. It also meant the import-map walk could not
+      // see bare specifiers inside those lazily-fetched siblings.
+      const seeded = [...okUrls];
+      const graph = await crawlGraph(seeded, async (url) => {
+        try {
+          await vendorOne(url, vendorRoot);
+        } catch {
+          return null;
+        }
+        return fs.readFile(path.join(vendorRoot, vendorPathFor(url)), 'utf8').catch(() => null);
+      });
+      if (graph.truncated) {
+        warn(`dependency graph exceeded ${graph.urls.length} files; some imports may stay remote`);
+      }
+      for (const bad of graph.urls.filter((u) => !okUrls.has(u))) okUrls.add(bad);
+
       // A vendored add-on still imports the bare specifier `three`, which no
-      // browser can resolve. Derive an import map from the same URLs so the
-      // library's own module graph closes.
+      // browser can resolve. Derive an import map from the whole graph.
       const map = await buildImportMap(
-        [...okUrls].map((u) => vendorPathFor(u).split(path.sep).join('/')),
+        graph.urls.map((u) => vendorPathFor(u).split(path.sep).join('/')),
         (rel) => fs.readFile(path.join(vendorRoot, rel), 'utf8').catch(() => null),
       );
       if (map.unmapped.length) {
@@ -612,7 +658,11 @@ export function createStaticHandler({ root, liveReload, vendorRoot, onVendor }) 
       return;
     }
 
-    // Vendor cache
+    // Vendor cache.
+    //
+    // The on-disk copy is a faithful mirror of upstream (so the manifest's
+    // SHA-256 stays meaningful). The two transforms a browser needs - a correct
+    // MIME type and rewritten specifiers - are applied here, per request.
     if (urlPath.startsWith(VENDOR_PREFIX)) {
       const rel = urlPath.slice(VENDOR_PREFIX.length);
       const abs = path.resolve(vendorRoot, rel);
@@ -620,25 +670,50 @@ export function createStaticHandler({ root, liveReload, vendorRoot, onVendor }) 
         sendText(res, 403, 'Forbidden');
         return;
       }
+
+      const remote = await remoteUrlFor(rel, vendorRoot);
+
       try {
         await fs.access(abs);
       } catch {
-        // Not cached yet: fetch it now so a cold start still works.
-        const remote = `https://${rel}`;
-        if (isVendorable(remote)) {
+        // Not cached yet: fetch it now so a cold start still works. A path that
+        // maps to no vendorable URL is refused rather than guessed at.
+        if (remote) {
           try {
             await vendorOne(remote, vendorRoot);
-            await serveFile(req, res, abs);
-            return;
           } catch (error) {
             sendText(res, 502, `vendor fetch failed: ${error.message}`);
             return;
           }
+        } else {
+          sendText(res, 404, 'Not vendored');
+          return;
         }
-        sendText(res, 404, 'Not vendored');
+      }
+
+      // Only a module-shaped path is rewritten; `remote` is null for a
+      // not-yet-downloaded unknown path, and MIME detection still needs a
+      // plausible URL, so fall back to the path-as-URL form for that check.
+      const shapeHint = remote ?? `https://${rel}`;
+      const isModule = looksLikeVendorModule(rel, shapeHint);
+      const type = contentTypeFor(abs, { vendorHint: isModule });
+
+      if (!isModule) {
+        await serveFile(req, res, abs);
         return;
       }
-      await serveFile(req, res, abs);
+
+      // Rewrite on the way out. Root-absolute specifiers - the form esm.sh,
+      // skypack and jsdelivr's /+esm all emit - resolve against OUR origin when
+      // served, so `export * from '/npm/d3-array@3.2.4/+esm'` 404s unless it
+      // carries the vendor prefix.
+      try {
+        const source = await fs.readFile(abs, 'utf8');
+        const rewritten = rewriteModuleSource(source, shapeHint);
+        sendText(res, 200, rewritten, type, { 'Cache-Control': 'no-cache' });
+      } catch {
+        sendText(res, 404, 'Not found');
+      }
       return;
     }
 
@@ -714,8 +789,51 @@ export function createStaticHandler({ root, liveReload, vendorRoot, onVendor }) 
       return;
     }
 
+    // A local module that imports from a CDN needs the same treatment as the
+    // HTML that pulls it in. Scanning only .html meant a sibling .js file's
+    // dependency was never vendored and never rewritten, so the page silently
+    // reached for the network - and broke the moment it was gone.
+    if (/\.(m?js|jsx)$/i.test(abs)) {
+      await serveModule(res, abs, urlPath);
+      return;
+    }
+
     await serveFile(req, res, abs);
   };
+
+  /**
+   * Serves a project module, vendoring and rewriting any CDN import it makes.
+   */
+  async function serveModule(res, absPath, urlPath) {
+    const raw = await fs.readFile(absPath, 'utf8');
+    const found = findCdnUrls(raw);
+
+    if (!found.length || !vendorRoot) {
+      sendText(res, 200, raw, contentTypeFor(absPath));
+      return;
+    }
+
+    const results = (await onVendor?.(found, absPath)) ?? [];
+    const okUrls = new Set(results.filter((r) => r?.status !== 'error').map((r) => r?.url));
+
+    const graph = await crawlGraph([...okUrls], async (url) => {
+      try {
+        await vendorOne(url, vendorRoot);
+      } catch {
+        return null;
+      }
+      return fs.readFile(path.join(vendorRoot, vendorPathFor(url)), 'utf8').catch(() => null);
+    });
+    for (const url of graph.urls) okUrls.add(url);
+
+    // An import map is an HTML-only construct: a `<script type="importmap">` in a
+    // .js response is a syntax error and the browser never runs the module. So
+    // the map is injected into the document (see serveHtml, which reads this
+    // file's bare specifiers while building the page), and the module itself
+    // only gets its absolute CDN URLs pointed at the local cache.
+    let out = rewriteCdnUrls(raw, { only: okUrls }).html;
+    sendText(res, 200, out, contentTypeFor(absPath), { 'Cache-Control': 'no-cache' });
+  }
 
   handler.hub = hub;
   handler.close = () => hub?.closeAll();

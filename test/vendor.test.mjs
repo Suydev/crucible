@@ -15,6 +15,7 @@ import {
   rewriteCdnUrls,
   findCdnUrls,
   readManifest,
+  remoteUrlFor,
 } from '../lib/vendor.mjs';
 
 test('allowlist accepts known CDNs', () => {
@@ -82,4 +83,54 @@ test('manifest read is tolerant of a missing or corrupt file', async () => {
   assert.deepEqual(corrupt.entries, {}, 'corrupt manifest must not throw');
 
   await fs.rm(dir, { recursive: true, force: true });
+});
+
+// ------------------------------------------------------ manifest reverse lookup
+
+test('a cached path maps back to its upstream URL, query and all', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'simhost-rev-'));
+  try {
+    // The manifest is written directly rather than by downloading: this suite
+    // must never touch the network.
+    const url = 'https://esm.sh/three@0.128.0?target=es2022';
+    const rel = vendorPathFor(url);
+    assert.ok(rel.includes('__q'), 'the query must have been folded into the name');
+
+    await fs.writeFile(path.join(root, 'manifest.json'), JSON.stringify({
+      version: 1,
+      entries: { [url]: { file: rel, sha256: 'x', bytes: 1 } },
+    }));
+
+    // Reconstructing by prefixing https:// would request a URL that does not
+    // exist upstream, so the manifest is the only thing that knows the query.
+    assert.equal(await remoteUrlFor(rel, root), url);
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test('an uncached path falls back to the path-as-URL form', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'simhost-rev2-'));
+  try {
+    // No manifest entry exists, but the path is a valid allowlisted URL, and
+    // guessing here is what lets a cold cache fetch on demand. The manifest
+    // only has to win when the two forms differ.
+    assert.equal(
+      await remoteUrlFor('unpkg.com/not-cached/file.js', root),
+      'https://unpkg.com/not-cached/file.js',
+    );
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test('a non-allowlisted host is never returned by the reverse lookup', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'simhost-rev3-'));
+  try {
+    await fs.mkdir(path.join(root, 'evil.example'), { recursive: true });
+    await fs.writeFile(path.join(root, 'evil.example', 'x.js'), 'x');
+    assert.equal(await remoteUrlFor('evil.example/x.js', root), null);
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
 });

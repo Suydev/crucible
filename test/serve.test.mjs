@@ -57,6 +57,28 @@ before(async () => {
   await fs.mkdir(path.join(dir, 'node_modules'), { recursive: true });
   await fs.writeFile(path.join(dir, 'node_modules', 'secret.html'), '<html>secret</html>');
 
+  // A module that names its dependency by full CDN URL - the form that needs
+  // no import map, because the specifier is already resolvable.
+  await fs.writeFile(path.join(dir, 'dep-consumer.js'),
+    "import * as THREE from 'https://unpkg.com/three@0.128.0/build/three.module.js';\n"
+    + 'export const v = THREE.REVISION;\n');
+  await fs.writeFile(path.join(dir, 'dep-page.html'),
+    '<!DOCTYPE html><html><head><title>Deps</title></head><body>'
+    + '<script type="module" src="./dep-consumer.js"></script></body></html>');
+
+  // A module using a BARE specifier, on a page that anchors the package with a
+  // full CDN URL. The document's import map is what resolves it.
+  await fs.writeFile(path.join(dir, 'bare-consumer.js'),
+    "import * as THREE from 'three';\nexport const v = THREE.REVISION;\n");
+  await fs.writeFile(path.join(dir, 'bare-page.html'),
+    '<!DOCTYPE html><html><head><title>Bare</title></head><body>'
+    + '<script type="module" src="./bare-consumer.js"></script>'
+    + '<script type="module" src="https://unpkg.com/three@0.128.0/build/three.module.js"></script>'
+    + '</body></html>');
+  await fs.writeFile(path.join(dir, 'escape-page.html'),
+    '<!DOCTYPE html><html><head><title>Esc</title></head><body>'
+    + '<script type="module" src="../../../etc/passwd"></script></body></html>');
+
   const port = await freePort();
   const config = loadConfig(['--single', '--root', dir, '--port', String(port), '--no-reload'], {});
   server = createServer(config);
@@ -180,4 +202,45 @@ test('unknown paths 404 with a helpful message', async () => {
   assert.equal(res.status, 404);
   const body = await res.text();
   assert.ok(body.includes('Not found') || body.includes('404'));
+});
+
+// A document's dependencies are not always in the document. A page that loads
+// `<script type="module" src="./scene.js">` puts its bare `three` import in
+// scene.js, which the HTML handler never reads. These cover the wiring that
+// makes one import map cover both levels - and that a module response does not
+// contain an import map, which would be a syntax error in the browser.
+
+test('a module response is rewritten JS, never an HTML import map', async () => {
+  const js = await fetch(`${origin}/dep-consumer.js`);
+  assert.equal(js.status, 200);
+  assert.match(js.headers.get('content-type'), /javascript/);
+  const body = await js.text();
+  assert.ok(!body.includes('importmap'),
+    'an import map in a .js response is a syntax error; it belongs in the HTML');
+  assert.ok(!body.includes('<script'),
+    'no HTML may be spliced into a module response');
+  // Whether the rewrite lands needs a download, which this suite must not make.
+  // What must hold offline is that no import map is spliced into the module.
+  assert.ok(body.includes('three.module.js'),
+    'an unreachable dependency is left as-is rather than corrupted');
+});
+
+test('a page vendors a dep declared only in a local module', async () => {
+  const res = await fetch(`${origin}/dep-page.html`);
+  assert.equal(res.status, 200);
+  // Nothing in the HTML names a CDN URL, so this only works because the module
+  // was read. Without that the page would load with a live network dependency.
+  assert.ok((await res.text()).includes('<p>deps</p>') === false);
+  const js = await fetch(`${origin}/dep-consumer.js`);
+  assert.ok((await js.text()).includes('__simhost/vendor/'),
+    'the module-only dependency must be vendored');
+});
+
+test('a local module src is confined to the project root', async () => {
+  // An escaping src must not be read; the page still serves, just without the
+  // dependency the traversal refused to follow.
+  const res = await fetch(`${origin}/escape-page.html`);
+  assert.equal(res.status, 200);
+  assert.ok(!(await res.text()).includes('importmap'),
+    'an escaping script src must not contribute an import map');
 });

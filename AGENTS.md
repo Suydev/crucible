@@ -21,7 +21,14 @@ There is no build step and no npm install. Do not add one.
    happen in memory per request. A file on disk is a plain HTML file and must
    stay that way, or the user loses the ability to use it without this server.
 3. **Never fetch an arbitrary URL.** `lib/vendor.mjs` holds an allowlist of CDN
-   hosts. Adding a host widens the trust boundary - do it deliberately.
+   hosts, HTTPS only, with every redirect hop re-validated. Adding a host widens
+   the trust boundary - do it deliberately.
+3a. **The vendor cache is a faithful mirror.** Cache bytes stay byte-identical to
+   upstream so `manifest.json` hashes mean something; MIME and specifier
+   rewrites happen at serve time. Do not write transforms into the cache.
+3b. **An import map belongs to the HTML, never to a `.js` response.**
+   `<script type="importmap">` inside a module is a syntax error. Local modules
+   get URL rewrites; the document carries the map.
 4. **Path traversal is a hard failure, not a fallback.** Every request path is
    resolved and checked with `isInside`. A request that escapes the root is a
    403. Never "clean up" the path and continue.
@@ -72,6 +79,7 @@ lib/editor.mjs          file CRUD for the dashboard editor (security boundary)
 lib/editor-ui.mjs       editor markup, styles, and client behaviour
 lib/settings.mjs        persisted roots/port in ~/.crucible/config.json
 lib/http-guard.mjs      loopback Host, same-origin Origin, JSON-only bodies
+lib/vendor-graph.mjs    recursive CDN graph crawl and specifier rewriting
 lib/import-map.mjs       import maps so vendored module graphs resolve
 lib/html.mjs            escaping, metadata extraction, runtime injection
 lib/mime.mjs            content types
@@ -122,6 +130,19 @@ Two traps that have already bitten this suite:
 - A test cannot assert "the process exits", because the test runner keeps the
   event loop alive itself. Assert on the specific resource instead, via
   `process.getActiveResourcesInfo()`.
+
+Dependency work has its own traps, each of which shipped a broken page once:
+
+- An import map is HTML-only. Injecting one into a `.js` response is a syntax
+  error, and the module never runs at all.
+- A page's bare specifiers often live in a local module the document handler
+  never reads. `findLocalModuleScripts` exists to close that.
+- Chromium strict-checks MIME on module scripts, so an extensionless vendor URL
+  served as `application/octet-stream` fails before any library code runs.
+- `vendorPathFor` folds a query into a `__q<hash>` filename, so the upstream URL
+  cannot be recovered by prefixing `https://` - the manifest is authoritative.
+- Resolving `./x.js` against the wrong directory silently yields an empty graph.
+  In tests, assert mock keys against what `resolveEdge` actually produces.
 
 When a refactor changes a function signature used by the request path, add a
 real HTTP test. `test/serve.test.mjs` exists because a signature change once

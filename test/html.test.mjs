@@ -11,6 +11,7 @@ import {
   extractTitle,
   extractDescription,
   injectRuntime,
+  findLocalModuleScripts,
   RUNTIME_MARKER,
 } from '../lib/html.mjs';
 
@@ -76,4 +77,43 @@ test('injection preserves the original body content', () => {
 test('injection places the script before the closing body tag', () => {
   const out = injectRuntime('<html><body>x</body></html>', OPTS);
   assert.ok(out.indexOf('runtime.js') < out.indexOf('</body>'));
+});
+
+// ---------------------------------------------------------- module scanning
+
+test('local module scripts are found', () => {
+  const html = `
+    <script type="module" src="./scene.js"></script>
+    <script type="module" src='./other.js'></script>
+    <script type=module src="/abs/root.js"></script>
+  `;
+  assert.deepEqual(findLocalModuleScripts(html), ['./scene.js', './other.js', '/abs/root.js']);
+});
+
+test('absolute, data, and vendor scripts are not treated as local', () => {
+  const html = `
+    <script type="module" src="https://unpkg.com/three@0.128.0/build/three.module.js"></script>
+    <script type="module" src="//cdn.example/x.js"></script>
+    <script type="module" src="data:text/javascript,1"></script>
+    <script type="module" src="/__simhost/runtime.js"></script>
+    <script type="module" src="./local.js"></script>
+  `;
+  assert.deepEqual(findLocalModuleScripts(html), ['./local.js']);
+});
+
+test('non-module scripts are ignored', () => {
+  assert.deepEqual(
+    findLocalModuleScripts('<script src="./classic.js"></script><script src="./m.js" type="module"></script>'),
+    ['./m.js'],
+  );
+});
+
+test('a duplicate module src is listed once', () => {
+  const html = '<script type="module" src="./a.js"></script><script type="module" src="./a.js"></script>';
+  assert.deepEqual(findLocalModuleScripts(html), ['./a.js']);
+});
+
+test('a document with no module scripts yields nothing', () => {
+  assert.deepEqual(findLocalModuleScripts('<html><body>hi</body></html>'), []);
+  assert.deepEqual(findLocalModuleScripts(''), []);
 });
