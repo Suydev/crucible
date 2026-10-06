@@ -1,10 +1,20 @@
 /* runtime.css
    Injected into every served simulation. Intentionally near-empty: it only
    supplies the small shared surface the dev runtime needs, so simulations keep
-   full control of their own layout and styling. */
+   full control of their own layout and styling.
 
-:root {
+   Notably it does NOT set `color-scheme`. It used to force dark, which quietly
+   overrode the UA rendering of form controls and scrollbars for any simulation
+   that had not opted in. The dev overlay styles itself instead. */
+
+/* Opt in only if the simulation wants it, e.g.
+   <html data-sim-host-theme="dark"> */
+[data-sim-host-theme='dark'] {
   color-scheme: dark;
+}
+
+[data-sim-host-theme='light'] {
+  color-scheme: light;
 }
 
 [data-sim-host-focus] {

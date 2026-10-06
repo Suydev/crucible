@@ -30,7 +30,10 @@ import { spawn } from 'node:child_process';
 
 import { loadConfig, ConfigError, USAGE, ROOT } from './lib/config.mjs';
 import { contentTypeFor, isReloadSensitive, looksLikeVendorModule } from './lib/mime.mjs';
-import { escapeHtml, injectRuntime, findLocalModuleScripts } from './lib/html.mjs';
+import {
+  escapeHtml, injectRuntime, findLocalModuleScripts,
+  parseCsp, stripIntegrityForVendor,
+} from './lib/html.mjs';
 import { scanSimulations } from './lib/scanner.mjs';
 import { renderDashboard } from './lib/dashboard.mjs';
 import { startWatching } from './lib/watcher.mjs';
@@ -43,6 +46,7 @@ import {
   findCdnUrls,
   isVendorable,
   remoteUrlFor,
+  resolvePackageEntry,
 } from './lib/vendor.mjs';
 import {
   InstanceRegistry,
@@ -54,7 +58,7 @@ import {
 } from './lib/ports.mjs';
 import { scanWorkspace } from './lib/workspace.mjs';
 import { guardApiRequest } from './lib/http-guard.mjs';
-import { buildImportMap, injectImportMap } from './lib/import-map.mjs';
+import { buildImportMap, findBareSpecifiers, injectImportMap } from './lib/import-map.mjs';
 import { crawlGraph, rewriteModuleSource } from './lib/vendor-graph.mjs';
 import {
   EditorError,
@@ -365,6 +369,11 @@ export class HostController {
       // made each response cost ~19ms instead of ~3.7ms - a measured 5x.
       ...(this.config.quiet ? ['--quiet'] : []),
       ...(this.config.noReload ? ['--no-reload'] : []),
+      // Inherit the upstream so a hosted project sees its real API, not zeros.
+      ...(this.config.proxy ? ['--proxy', this.config.proxy] : []),
+      ...(Array.isArray(this.config.proxyPaths) && this.config.proxyPaths.length
+        ? ['--proxy-paths', this.config.proxyPaths.join(',')]
+        : []),
     ], {
       detached: true,
       // Pipes rather than the raw fd: Node makes fd-backed stdio synchronous
@@ -496,10 +505,270 @@ export class HostController {
 // ---------------------------------------------------------------- static serving
 
 /**
+ * Memo for resolved dependency sets.
+ *
+ * Every request otherwise re-walks the graph and re-reads the cache, which cost
+ * 150ms on a warm two-file graph against 14ms for a document with no
+ * dependencies. Keyed on the dependency SET, not the directory, so a document
+ * that gains a new import misses the cache and is resolved again.
+ */
+const DEP_CACHE_TTL_MS = 30_000;
+const depCache = new Map();
+
+/**
+ * The single document pipeline: vendor the dependency graph, rewrite it, apply
+ * CSP/SRI fixes, and inject the dev runtime.
+ *
+ * Both the single-project handler and the legacy /sims/ route call this. They
+ * used to have separate copies, which meant fixing one left the other on the
+ * old code - the divergence that had /sims/ silently skipping the graph crawl
+ * and the import map entirely.
+ *
+ * @param {string} raw            document source
+ * @param {object} opts
+ * @param {(value:string)=>Promise<string|null>} [opts.readLocalModule]
+ * @returns {Promise<string>} document ready to send
+ */
+async function prepareDocument(raw, opts) {
+  const {
+    urlPath, name, liveReload = true, index = false,
+    readLocalModule = null, vendorRoot: vRoot, onVendor: oVendor,
+  } = opts;
+
+  // A CSP meta would otherwise refuse the injected runtime and fail silently.
+  const csp = parseCsp(raw);
+
+  // Seed set: the document plus every project-local module it loads, since a
+  // page's bare dependencies often live in a file the document never reads.
+  const found = findCdnUrls(raw);
+
+  // Bare specifiers count as dependencies too. A page whose only import is
+  // `import('three')` names no CDN URL at all, so keying the whole pipeline off
+  // findCdnUrls would skip it and leave the simulation blank.
+  const bare = new Set(findBareSpecifiers(raw));
+
+  if (vRoot && readLocalModule) {
+    for (const value of findLocalModuleScripts(raw)) {
+      const source = await readLocalModule(value);
+      if (source == null) continue;
+      for (const url of findCdnUrls(source)) {
+        if (!found.includes(url)) found.push(url);
+      }
+      for (const specifier of findBareSpecifiers(source)) bare.add(specifier);
+    }
+  }
+
+  let working = raw;
+  let okUrls = new Set();
+
+  if ((found.length || bare.size) && vRoot) {
+    const key = [...found].sort().join('|') + '\u0000' + [...bare].sort().join('|');
+    const hit = depCache.get(key);
+    if (hit && Date.now() - hit.at < DEP_CACHE_TTL_MS) {
+      working = injectImportMap(raw, hit.imports);
+      working = rewriteCdnUrls(working, { only: hit.urls }).html;
+      working = stripIntegrityForVendor(working);
+      return injectRuntime(working, {
+        cssHref: '/__simhost/runtime.css',
+        jsSrc: '/__simhost/runtime.js',
+        config: { name, path: urlPath, liveReload, index },
+        nonce: csp,
+      });
+    }
+
+    const results = (await oVendor?.(found, urlPath)) ?? [];
+    for (const bad of results.filter((r) => r?.status === 'error')) {
+      warn(`vendor failed: ${bad.url} - ${bad.error}`);
+    }
+    okUrls = new Set(results.filter((r) => r?.status !== 'error').map((r) => r?.url));
+    const stillRemote = found.filter((u) => !okUrls.has(u));
+    if (stillRemote.length) {
+      warn(`${stillRemote.length} dependency/dependencies unavailable; left as remote URLs`);
+    }
+
+    const graph = await crawlGraph([...okUrls], async (url) => {
+      try {
+        await vendorOne(url, vRoot);
+      } catch {
+        return null;
+      }
+      return fs.readFile(path.join(vRoot, vendorPathFor(url)), 'utf8').catch(() => null);
+    });
+    if (graph.truncated) {
+      warn(`dependency graph reached ${graph.urls.length} files; some imports may stay remote`);
+    }
+    for (const url of graph.urls) okUrls.add(url);
+
+    const seedPaths = () => graph.urls.map((u) => vendorPathFor(u).split(path.sep).join('/'));
+    const readCached = (rel) => fs.readFile(path.join(vRoot, rel), 'utf8').catch(() => null);
+
+    let map = await buildImportMap(seedPaths(), readCached);
+
+    // A bare specifier with nothing anchoring it - the page never names the
+    // package by URL - has no entry to map to. Ask the CDN for the package's
+    // own metadata rather than leaving the simulation blank, then retry with
+    // whatever that turned up.
+    // Anything still unresolved, plus bare specifiers that appeared only in the
+    // document itself and so were never seen by the graph walk.
+    const wantEntries = [...new Set([...map.unmapped, ...bare])];
+    // Bare specifiers the document itself uses are not in any graph file, so
+    // buildImportMap cannot see them. Record what each one resolved to and merge
+    // it in directly, or the map comes out empty and the page stays blank.
+    const resolved = {};
+    if (wantEntries.length) {
+      const anchors = [...okUrls];
+      let progressed = false;
+      for (const specifier of wantEntries) {
+        const entry = await resolvePackageEntry(specifier, vRoot).catch(() => null);
+        if (!entry) continue;
+        try {
+          await vendorOne(entry, vRoot);
+        } catch {
+          continue;
+        }
+        resolved[specifier] = `/__simhost/vendor/${vendorPathFor(entry).split(path.sep).join('/')}`;
+        anchors.push(entry);
+        progressed = true;
+      }
+      if (progressed) {
+        const grown = await crawlGraph(anchors, async (url) => {
+          try {
+            await vendorOne(url, vRoot);
+          } catch {
+            return null;
+          }
+          return readCached(vendorPathFor(url).split(path.sep).join('/'));
+        });
+        for (const url of grown.urls) if (!graph.urls.includes(url)) graph.urls.push(url);
+        map = await buildImportMap(seedPaths(), readCached);
+      }
+    }
+
+    const imports = { ...resolved, ...map.imports };
+    const stillMissing = map.unmapped.filter((specifier) => !imports[specifier]);
+    if (stillMissing.length) {
+      warn(`could not map bare import(s): ${stillMissing.join(', ')}`);
+    }
+    depCache.set(key, { imports, urls: new Set(graph.urls), at: Date.now() });
+    working = injectImportMap(working, imports);
+    working = rewriteCdnUrls(working, { only: new Set(graph.urls) }).html;
+  }
+
+  // Our served bytes are rewritten, so any SRI hash inherited from the CDN no
+  // longer describes them and would fail the load for no visible reason.
+  working = stripIntegrityForVendor(working);
+
+  const injected = injectRuntime(working, {
+    cssHref: '/__simhost/runtime.css',
+    jsSrc: '/__simhost/runtime.js',
+    config: { name, path: urlPath, liveReload, index },
+    nonce: csp,
+  });
+
+  if (csp?.present && !csp.scriptNonce) {
+    warn('page has a Content-Security-Policy meta without a nonce; '
+      + 'if the runtime is blocked, add a nonce or allow the dev origin');
+  }
+
+  return injected;
+}
+
+/**
+ * Forwards a request to a project's real API upstream.
+ *
+ * A simulation whose frontend calls /api/* otherwise renders its chrome and
+ * every data frame, but no data - and the dashboard's own UI is indistinguishable
+ * from "no traffic yet". Forwarding makes the preview tell the truth.
+ *
+ * Deliberately transparent: no buffering and no content-encoding rewriting, so
+ * a server-sent event stream passes through intact. Redirects are rewritten so
+ * they cannot escape the preview origin.
+ */
+function proxyRequest(req, res, upstream, urlPath) {
+  const target = new URL(upstream);
+  // Forward the path unchanged. The upstream is the project's own server and
+  // serves /api/* at exactly these paths, so stripping the prefix would ask it
+  // for a route it does not have.
+  const search = req.url.includes('?') ? req.url.slice(req.url.indexOf('?')) : '';
+  const proxiedPath = urlPath;
+
+  const upstreamReq = http.request({
+    protocol: target.protocol,
+    hostname: target.hostname,
+    port: target.port || (target.protocol === 'https:' ? 443 : 80),
+    path: (target.pathname.replace(/\/$/, '') + proxiedPath) + search,
+    method: req.method,
+    headers: { ...req.headers, host: target.host },
+  }, (upstreamRes) => {
+    const headers = { ...upstreamRes.headers };
+    // A Location pointing at the upstream would navigate the preview off-origin.
+    if (headers.location) {
+      headers.location = String(headers.location).replace(
+        new RegExp(`^${target.origin}`), '');
+    }
+    res.writeHead(upstreamRes.statusCode ?? 502, headers);
+    upstreamRes.pipe(res);
+  });
+
+  upstreamReq.on('error', (error) => {
+    // Surface the failure instead of letting the preview show stale zeros.
+    if (!res.headersSent) {
+      sendJson(res, 502, {
+        error: `upstream ${target.origin} unavailable: ${error.message}`,
+        hint: 'start the project\'s own server, or drop --proxy',
+      });
+    } else {
+      res.destroy(error);
+    }
+  });
+
+  req.on('error', () => upstreamReq.destroy());
+  req.pipe(upstreamReq);
+}
+
+/** True when this request should go to the configured upstream. */
+function isProxiedPath(urlPath, paths) {
+  for (const prefix of (paths?.length ? paths : ['/api/'])) {
+    if (urlPath === prefix) return true;
+    if (urlPath.startsWith(prefix.endsWith('/') ? prefix : `${prefix}/`)) return true;
+    // A bare prefix like /graphql should also match /graphql itself.
+    if (!prefix.endsWith('/') && urlPath.startsWith(`${prefix}/`)) return true;
+  }
+  return false;
+}
+
+/**
+ * Serves the project's own 404 page when it has one.
+ *
+ * A static site usually ships 404.html, and a PWA ships offline.html for its
+ * fallback. Returning crucible's plain-text 404 left a project's own error page
+ * unreachable in preview, which is exactly the page you most want to check.
+ */
+async function sendProjectNotFound(res, urlPath, root) {
+  if (root) {
+    for (const name of ['404.html', 'offline.html']) {
+      const candidate = path.resolve(root, name);
+      if (!isInside(root, candidate)) continue;
+      const raw = await fs.readFile(candidate, 'utf8').catch(() => null);
+      if (raw == null) continue;
+      try {
+        sendText(res, 404, await prepareDocument(raw, {
+          urlPath: `/${name}`, name, liveReload: false, index: false,
+        }));
+        return;
+      } catch {
+        break;
+      }
+    }
+  }
+  sendText(res, 404, `404 Not found: ${escapeHtml(urlPath)}`);
+}
+
+/**
  * Builds a request handler that serves one directory (single-project mode).
  * This is what the dashboard spawns as a child process.
  */
-export function createStaticHandler({ root, liveReload, vendorRoot, onVendor }) {
+export function createStaticHandler({ root, liveReload, vendorRoot, onVendor, proxy = null, proxyPaths = null }) {
   const hub = liveReload ? new LiveReloadHub() : null;
 
   /** Resolves a document-relative script src to a path inside the root. */
@@ -513,83 +782,18 @@ export function createStaticHandler({ root, liveReload, vendorRoot, onVendor }) 
 
   async function serveHtml(res, htmlPath, urlPath) {
     const raw = await fs.readFile(htmlPath, 'utf8');
-
-    // Pull CDN deps into the local cache, then point the document at them.
-    // The seed set spans the HTML and every project module it loads, so one
-    // crawl covers bare specifiers declared at either level.
-    const found = findCdnUrls(raw);
-    if (vendorRoot) {
-      // Seed the crawl with the module's dependencies too, so one map covers
-      // the document and every project module it loads.
-      for (const value of findLocalModuleScripts(raw)) {
+    const html = await prepareDocument(raw, {
+      urlPath,
+      name: path.basename(htmlPath),
+      liveReload: Boolean(liveReload),
+      // Local modules this document loads, so one import map covers the page.
+      readLocalModule: async (value) => {
         const abs = resolveLocalScript(value, urlPath);
-        if (!abs) continue;
-        const source = await fs.readFile(abs, 'utf8').catch(() => null);
-        if (source == null) continue;
-        for (const url of findCdnUrls(source)) {
-          if (!found.includes(url)) found.push(url);
-        }
-      }
-    }
-
-    let working = raw;
-    if (found.length && vendorRoot) {
-      const results = (await onVendor?.(found, htmlPath)) ?? [];
-      // A download that failed must not be rewritten to a local path: the
-      // document would load with 200 while every sub-request 404s, and the
-      // failure only showed up as a console error.
-      const failed = results.filter((r) => r?.status === 'error');
-      for (const bad of failed) {
-        warn(`vendor failed: ${bad.url} - ${bad.error}`);
-      }
-      const okUrls = new Set(results.filter((r) => r?.status !== 'error').map((r) => r?.url));
-      const stillRemote = found.filter((u) => !okUrls.has(u));
-      if (stillRemote.length) {
-        warn(`${stillRemote.length} dependency/dependencies unavailable; left as remote URLs`);
-      }
-
-      // Crawl the FULL graph before answering. Previously only the entry files
-      // named in the HTML were downloaded and everything deeper was fetched
-      // lazily at browser-request time. That made the page depend on the server
-      // being online: with the whole stack offline, a relative sibling that was
-      // never pre-downloaded 502s. It also meant the import-map walk could not
-      // see bare specifiers inside those lazily-fetched siblings.
-      const seeded = [...okUrls];
-      const graph = await crawlGraph(seeded, async (url) => {
-        try {
-          await vendorOne(url, vendorRoot);
-        } catch {
-          return null;
-        }
-        return fs.readFile(path.join(vendorRoot, vendorPathFor(url)), 'utf8').catch(() => null);
-      });
-      if (graph.truncated) {
-        warn(`dependency graph exceeded ${graph.urls.length} files; some imports may stay remote`);
-      }
-      for (const bad of graph.urls.filter((u) => !okUrls.has(u))) okUrls.add(bad);
-
-      // A vendored add-on still imports the bare specifier `three`, which no
-      // browser can resolve. Derive an import map from the whole graph.
-      const map = await buildImportMap(
-        graph.urls.map((u) => vendorPathFor(u).split(path.sep).join('/')),
-        (rel) => fs.readFile(path.join(vendorRoot, rel), 'utf8').catch(() => null),
-      );
-      if (map.unmapped.length) {
-        warn(`could not map bare import(s): ${map.unmapped.join(', ')}`);
-      }
-      working = injectImportMap(working, map.imports);
-      working = rewriteCdnUrls(working, { only: okUrls }).html;
-    }
-
-    const html = injectRuntime(working, {
-      cssHref: '/__simhost/runtime.css',
-      jsSrc: '/__simhost/runtime.js',
-      config: {
-        name: path.basename(htmlPath),
-        path: urlPath,
-        liveReload: Boolean(liveReload),
-        index: false,
+        if (!abs) return null;
+        return fs.readFile(abs, 'utf8').catch(() => null);
       },
+      vendorRoot,
+      onVendor,
     });
     sendText(res, 200, html, 'text/html; charset=utf-8');
   }
@@ -655,6 +859,12 @@ export function createStaticHandler({ root, liveReload, vendorRoot, onVendor }) 
         // never produce headers, so the request hung until it timed out.
         sendText(res, 503, 'live reload is disabled');
       }
+      return;
+    }
+
+    // A project's real API, if one was configured.
+    if (proxy && isProxiedPath(urlPath, proxyPaths)) {
+      proxyRequest(req, res, proxy, urlPath);
       return;
     }
 
@@ -751,7 +961,7 @@ export function createStaticHandler({ root, liveReload, vendorRoot, onVendor }) 
     try {
       stat = await fs.stat(abs);
     } catch {
-      sendText(res, 404, `404 Not found: ${escapeHtml(urlPath)}`);
+      await sendProjectNotFound(res, urlPath, root);
       return;
     }
 
@@ -771,15 +981,36 @@ export function createStaticHandler({ root, liveReload, vendorRoot, onVendor }) 
         const entries = await fs.readdir(abs, { withFileTypes: true });
         const rows = entries
           .filter((e) => !e.name.startsWith('.'))
+          .sort((a, b) => Number(b.isDirectory()) - Number(a.isDirectory())
+            || a.name.localeCompare(b.name))
           .map((e) => {
             const href = `${urlPath.replace(/\/$/, '')}/${encodeURIComponent(e.name)}${e.isDirectory() ? '/' : ''}`;
-            return `<li><a href="${escapeHtml(href)}">${escapeHtml(e.name)}${e.isDirectory() ? '/' : ''}</a></li>`;
+            const suffix = e.isDirectory() ? '/' : '';
+            return `<li><a href="${escapeHtml(href)}">${escapeHtml(e.name)}${suffix}</a></li>`;
           })
           .join('');
-        sendText(res, 200, `<!DOCTYPE html><meta charset="utf-8"><title>${escapeHtml(path.basename(abs))}</title>`
-          + '<style>body{font:14px ui-monospace,monospace;background:#0f1115;color:#e6e9ef;padding:28px}'
-          + 'li{margin:4px 0}a{color:#4fc3f7}</style>'
-          + `<h2>${escapeHtml(path.basename(abs))}</h2><ul>${rows}</ul>`, 'text/html; charset=utf-8');
+
+        // Goes through the normal pipeline so a listing gets live reload too.
+        // Navigating from a listing was the one place an edit could not appear
+        // without a manual refresh.
+        const listing = `<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">`
+          + '<meta name="viewport" content="width=device-width, initial-scale=1">'
+          + `<title>${escapeHtml(path.basename(abs))}</title>`
+          + '<style>body{font:15px/1.6 ui-sans-serif,system-ui,sans-serif;background:#0f1115;'
+          + 'color:#e6e9ef;margin:0;padding:32px 24px}a{color:#4fc3f7;text-decoration:none;display:inline-block;'
+          + 'padding:6px 0}a:hover{text-decoration:underline}ul{list-style:none;padding:0;margin:12px 0 0}'
+          + 'h1{font-size:18px;font-weight:600;margin:0 0 4px}p{color:#8b93a7;margin:0 0 8px;font-size:13px}</style>'
+          + '</head><body>'
+          + `<h1>${escapeHtml(path.basename(abs))}</h1>`
+          + `<p>${entries.filter((e) => !e.name.startsWith('.')).length} entries in ${escapeHtml(urlPath)}</p>`
+          + `<ul>${rows}</ul></body></html>`;
+
+        sendText(res, 200, await prepareDocument(listing, {
+          urlPath,
+          name: path.basename(abs),
+          liveReload: Boolean(liveReload),
+          index: false,
+        }), 'text/html; charset=utf-8');
       }
       return;
     }
@@ -983,20 +1214,43 @@ export function createServer(config) {
         try {
           const stat = await fs.stat(abs);
           if (stat.isFile()) {
-            const raw = await fs.readFile(abs, 'utf8');
-            const found = /\.html?$/i.test(abs) ? findCdnUrls(raw) : [];
-            let body = raw;
-            if (found.length) {
-              await vendorAllFor(found, abs);
-              body = rewriteCdnUrls(body).html;
+            // Same pipeline as every other served document. This route used to
+            // carry its own copy of the logic, so it missed the graph crawl and
+            // the import map while both were being fixed elsewhere.
+            if (/\.html?$/i.test(abs)) {
+              const raw = await fs.readFile(abs, 'utf8');
+              const html = await prepareDocument(raw, {
+                urlPath,
+                name: path.basename(abs),
+                liveReload: !config.noReload,
+                index: false,
+                readLocalModule: async (value) => {
+                  const fromUrl = value.startsWith('/')
+                    ? value
+                    : path.posix.join(path.posix.dirname(urlPath), value);
+                  const target = path.resolve(config.simulationsPath, `.${fromUrl}`);
+                  if (!isInside(config.simulationsPath, target)) return null;
+                  return fs.readFile(target, 'utf8').catch(() => null);
+                },
+                vendorRoot: config.vendorPath,
+                onVendor: vendorFor(config),
+              });
+              sendText(res, 200, html, 'text/html; charset=utf-8');
+              log(200);
+              return;
             }
-            const html = injectRuntime(body, {
-              cssHref: '/__simhost/runtime.css',
-              jsSrc: '/__simhost/runtime.js',
-              config: { name: path.basename(abs), path: urlPath, liveReload: !config.noReload, index: false },
-            });
-            sendText(res, 200, html, 'text/html; charset=utf-8');
-            log(200);
+
+            // Non-HTML under /sims/ (css, js, assets) is served as a file. It
+            // previously fell through to the plain-text 404 below, so a stylesheet
+            // referenced by a simulation 404'd.
+            try {
+              const fileStat = await fs.stat(abs);
+              sendFileStream(req, res, abs, fileStat);
+              log(200);
+            } catch {
+              sendText(res, 404, 'Not found');
+              log(404);
+            }
             return;
           }
         } catch {
@@ -1077,6 +1331,8 @@ export function createServer(config) {
       root: config.root,
       liveReload: config.noReload ? null : new LiveReloadHub(),
       vendorRoot: config.vendorPath,
+      proxy: config.proxy,
+      proxyPaths: config.proxyPaths,
       onVendor: async (urls) => {
         const { vendorAll } = await import('./lib/vendor.mjs');
         return vendorAll(urls, config.vendorPath, {
@@ -1330,10 +1586,14 @@ function assertKnownProject(controller, dir) {
   return abs;
 }
 
-async function vendorAllFor(urls, contextPath) {
-  const config = loadConfig();
-  const { vendorAll } = await import('./lib/vendor.mjs');
-  return vendorAll(urls, config.vendorPath, { log: (m) => info(`${path.basename(contextPath)}: ${m}`) });
+/** Builds an onVendor callback bound to a config, for prepareDocument. */
+function vendorFor(config) {
+  return async (urls, context) => {
+    const { vendorAll } = await import('./lib/vendor.mjs');
+    return vendorAll(urls, config.vendorPath, {
+      log: (m) => { if (!config.quiet) info(`${path.basename(String(context ?? ''))}: ${m}`); },
+    });
+  };
 }
 
 // ---------------------------------------------------------------- startup

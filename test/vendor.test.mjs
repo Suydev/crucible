@@ -134,3 +134,29 @@ test('a non-allowlisted host is never returned by the reverse lookup', async () 
     await fs.rm(root, { recursive: true, force: true });
   }
 });
+
+// -------------------------------------------------- bare package resolution
+
+test('package entry resolution refuses non-packages and subpaths', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'simhost-pkg-'));
+  try {
+    const { resolvePackageEntry } = await import('../lib/vendor.mjs');
+    // Resolving these would need a network round trip; the guard must reject
+    // them before that happens.
+    assert.equal(await resolvePackageEntry('./local.js', root), null);
+    assert.equal(await resolvePackageEntry('/abs.js', root), null);
+    assert.equal(await resolvePackageEntry('three/addons/controls/OrbitControls.js', root), null);
+    assert.equal(await resolvePackageEntry('@scope/pkg/sub', root), null);
+  } finally {
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test('a document naming only bare specs triggers dependency work', async () => {
+  const { findBareSpecifiers } = await import('../lib/import-map.mjs');
+  // The pipeline used to be keyed off findCdnUrls, so a page whose only import
+  // is `import('three')` named no CDN URL and was skipped entirely.
+  const html = '<script type="module">const m = await import("three");</script>';
+  assert.deepEqual(findBareSpecifiers(html), ['three']);
+  assert.deepEqual(findBareSpecifiers('<html><body>none</body></html>'), []);
+});

@@ -244,3 +244,33 @@ test('a local module src is confined to the project root', async () => {
   assert.ok(!(await res.text()).includes('importmap'),
     'an escaping script src must not contribute an import map');
 });
+
+// ---------------------------------------------------------- late additions
+
+test("a project's own 404 page is served, not ours", async () => {
+  await fs.writeFile(path.join(dir, '404.html'),
+    '<!DOCTYPE html><html><head><title>Not here</title></head><body><h1>Project 404</h1></body></html>');
+  const res = await fetch(`${origin}/definitely-missing.html`);
+  assert.equal(res.status, 404);
+  const body = await res.text();
+  assert.ok(body.includes('Project 404'),
+    "the project's own error page must be reachable in preview");
+  assert.ok(body.includes('runtime.js'), 'the 404 page still gets the runtime');
+});
+
+test('a directory listing is styled and gets live reload', async () => {
+  const res = await fetch(`${origin}/node_modules/`);
+  assert.equal(res.status, 200);
+  const body = await res.text();
+  assert.ok(body.includes('runtime.js'),
+    'a listing without the runtime cannot live-reload the file you click into');
+  assert.ok(!body.includes('font:14px ui-monospace'),
+    'the old bare listing markup should be gone');
+});
+
+test('a stylesheet under the root is served, not 404', async () => {
+  // Non-HTML under a project used to fall through to the 404 branch.
+  const res = await fetch(`${origin}/plain.css`);
+  assert.equal(res.status, 200);
+  assert.match(res.headers.get('content-type'), /text\/css/);
+});

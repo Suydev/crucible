@@ -107,6 +107,33 @@ host --roots ~/projects
 Hard skips (never descended into) include `node_modules`, `.git`, `dist`,
 `build`, `target`, `.next`, `.nuxt`, and all dot-directories.
 
+## No live reload on a page that has a CSP meta tag
+
+A strict `Content-Security-Policy` blocks the injected runtime, and the browser
+reports it as a plain script error. Crucible re-presents the page's nonce on its
+own injected tags, so this normally just works - if it does not, check that the
+meta tag actually carries a `nonce-` value. The server console says so when it
+finds a CSP without one.
+
+## A CDN script silently fails to load
+
+Check for an `integrity` attribute. Served bytes are rewritten to fix
+root-absolute specifiers, so an inherited hash no longer describes the content
+and the load is rejected. Crucible strips `integrity` from tags it repoints at
+the cache; an `integrity` on a tag left alone is preserved.
+
+## A simulation shows chrome but every number is zero
+
+Its frontend is calling an API the static server does not have. Start the
+project's own server and point crucible at it:
+
+```bash
+host --proxy http://127.0.0.1:3000
+```
+
+A dead upstream returns `502` with a reason, so a missing backend is
+distinguishable from an empty instance.
+
 ## A library loads but nothing renders, with no error
 
 Check the Content-Type the vendored file is served with:

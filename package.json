@@ -10,7 +10,7 @@
   },
   "scripts": {
     "start": "node server.mjs",
-    "dev": "node server.mjs --verbose",
+    "serve": "node server.mjs --single --root .",
     "list": "node server.mjs --list",
     "host": "bash scripts/host.sh",
     "host:status": "bash scripts/host.sh --status",

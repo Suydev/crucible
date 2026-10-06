@@ -12,6 +12,8 @@ import {
   extractDescription,
   injectRuntime,
   findLocalModuleScripts,
+  parseCsp,
+  stripIntegrityForVendor,
   RUNTIME_MARKER,
 } from '../lib/html.mjs';
 
@@ -116,4 +118,67 @@ test('a duplicate module src is listed once', () => {
 test('a document with no module scripts yields nothing', () => {
   assert.deepEqual(findLocalModuleScripts('<html><body>hi</body></html>'), []);
   assert.deepEqual(findLocalModuleScripts(''), []);
+});
+
+// ---------------------------------------------------------------- CSP / SRI
+
+test('a page with no CSP meta reports none', () => {
+  assert.equal(parseCsp('<html><head></head></html>'), null);
+  assert.equal(parseCsp(''), null);
+});
+
+test('script and style nonces are read from the CSP meta', () => {
+  const html = '<meta http-equiv="Content-Security-Policy" '
+    + `content="default-src 'self'; script-src 'nonce-abc123'; style-src 'nonce-xyz789'">`;
+  const csp = parseCsp(html);
+  assert.equal(csp.present, true);
+  assert.equal(csp.scriptNonce, 'abc123');
+  assert.equal(csp.styleNonce, 'xyz789');
+});
+
+test('default-src supplies the nonce when a directive omits one', () => {
+  const html = '<meta http-equiv=content-security-policy '
+    + `content="default-src 'nonce-fallback'">`;
+  assert.equal(parseCsp(html).scriptNonce, 'fallback');
+});
+
+test('a CSP with no nonce is still detected, with null nonces', () => {
+  const csp = parseCsp('<meta http-equiv="Content-Security-Policy" content="default-src \'self\'">');
+  assert.equal(csp.present, true);
+  assert.equal(csp.scriptNonce, null);
+});
+
+test('injected tags carry the page nonce so a strict CSP does not block them', () => {
+  const out = injectRuntime('<html><head></head><body></body></html>', {
+    cssHref: '/x.css', jsSrc: '/x.js', config: {},
+    nonce: { scriptNonce: 'abc123', styleNonce: 'xyz789' },
+  });
+  assert.ok(out.includes('nonce="abc123"'), 'script tags need the script nonce');
+  assert.ok(out.includes('nonce="xyz789"'), 'the stylesheet needs the style nonce');
+});
+
+test('no nonce is emitted when the page has no CSP', () => {
+  const out = injectRuntime('<html><head></head><body></body></html>', {
+    cssHref: '/x.css', jsSrc: '/x.js', config: {},
+  });
+  assert.ok(!out.includes('nonce='));
+});
+
+test('integrity is stripped only from tags we repointed at the cache', () => {
+  const html = '<script src="/__simhost/vendor/unpkg.com/a@1/a.js" '
+    + 'integrity="sha384-abc" crossorigin="anonymous"></script>';
+  const out = stripIntegrityForVendor(html);
+  assert.ok(!out.includes('integrity'));
+  assert.ok(!out.includes('crossorigin'));
+  assert.ok(out.includes('/__simhost/vendor/'), 'the tag itself must survive');
+});
+
+test('integrity on an untouched remote script is preserved', () => {
+  const html = '<script src="https://cdn.example/a.js" integrity="sha384-keep"></script>';
+  assert.ok(stripIntegrityForVendor(html).includes('sha384-keep'));
+});
+
+test('a rewritten stylesheet link also loses integrity', () => {
+  const html = '<link rel="stylesheet" href="/__simhost/vendor/x/y.css" integrity="sha384-z">';
+  assert.ok(!stripIntegrityForVendor(html).includes('integrity'));
 });

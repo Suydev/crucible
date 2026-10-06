@@ -469,7 +469,10 @@ function start() {
     installErrorTrap();
     connect();
     restoreState();
-    if (CONFIG.name) setHudState('static', CONFIG.name);
+    // Only label the HUD if it is not already reporting a live connection.
+    // connect() can win the race on a fast local link, and overwriting 'live'
+    // with 'static' made a working reload look disabled.
+    if (CONFIG.name && !hud?.classList.contains('live')) setHudState('static', CONFIG.name);
   };
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', boot, { once: true });

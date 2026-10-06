@@ -10,6 +10,8 @@
 | `--root <dir>` | repo root | Directory served in `--single` mode |
 | `--single` | off | Serve `--root` directly, no dashboard |
 | `--vendor-root <d>` | `vendor` | Vendor cache directory (must be absolute, or relative to the repo) |
+| `--proxy <origin>` | — | Forward matching paths to a project's own API |
+| `--proxy-paths <a,b>` | `/api/` | Which paths `--proxy` claims |
 | `--no-reload` | off | Disable SSE live reload |
 | `--list` | — | Print discovered projects and ports, then exit |
 | `-q, --quiet` | off | Suppress request logging |
@@ -184,9 +186,56 @@ URL for it appears in the document or a local module, for example:
 <script type="module" src="https://unpkg.com/three@0.128.0/build/three.module.js"></script>
 ```
 
-A module that uses a bare specifier with no such URL anywhere is reported as an
-unmapped import rather than being guessed at. Naming the version explicitly is
-always safer than letting a resolver pick one.
+When nothing anchors a bare specifier, the package's own metadata is fetched
+from the CDN and its declared entry point (`module`, then `main`, then
+`exports`) is vendored and mapped. The resolved version is pinned from that
+metadata and recorded in the manifest, so the choice is reproducible rather than
+implicit. Anything still ambiguous is reported rather than guessed at.
+
+Naming a version yourself is still better - it makes the dependency explicit
+instead of inferred.
+
+## Talking to a project's own API
+
+A simulation whose frontend calls `/api/*` otherwise renders its chrome and no
+data, and every metric reads as zero - indistinguishable from an empty
+instance. Point crucible at the project's real server:
+
+```bash
+host --proxy http://127.0.0.1:3000
+```
+
+Matching requests are forwarded with the path unchanged (the upstream serves
+`/api/*` at exactly those paths), with no buffering or content-encoding
+rewrite, so a server-sent event stream passes through intact. Redirects are
+rewritten back onto the preview origin so a `Location` cannot navigate away.
+
+Paths default to `/api/`; change them with `--proxy-paths /api/,/graphql`. A
+hosted project inherits the upstream from the dashboard.
+
+If the upstream is not running, the request returns `502` with a reason and a
+hint, so a dead backend is visible instead of looking like empty data.
+
+## Pages with a Content-Security-Policy
+
+A simulation carrying a CSP `<meta>` tag would otherwise refuse the injected
+runtime and config scripts, and the browser reports it as a script error with
+no mention of the dev server. The document's nonce is read and re-presented on
+the injected tags, so a strict-policy simulation still gets live reload. A CSP
+with no nonce is detected and reported on the server console.
+
+Subresource Integrity is stripped from any tag repointed at the local cache. The
+served bytes are deliberately rewritten - root-absolute specifiers are fixed so
+the browser can resolve them at all - so an inherited hash describes content
+that is no longer being served, and the script would fail for no visible
+reason.
+
+## A project's own 404 page
+
+If the served folder contains `404.html` or `offline.html`, that page is served
+for a missing path, with the runtime injected. Otherwise the plain-text fallback
+is used. A static site's error page and a PWA's offline fallback are otherwise
+unreachable in preview.
 
 ## Editor file rules
 
